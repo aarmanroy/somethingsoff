@@ -47,7 +47,7 @@ fn counts_to_json_map(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     let mut entries: Vec<_> = counts.into_iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (key, count) in entries {
         map.insert(key, serde_json::Value::Number(count.into()));
     }
