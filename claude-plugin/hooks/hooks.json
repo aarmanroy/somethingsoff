@@ -1,0 +1,17 @@
+{
+  "description": "When a Bash command fails, inject the project's indexed log evidence (top error group) into Claude's context",
+  "hooks": {
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v somethingsoff >/dev/null 2>&1 && somethingsoff claude hook || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

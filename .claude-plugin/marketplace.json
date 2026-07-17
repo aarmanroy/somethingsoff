@@ -1,0 +1,17 @@
+{
+  "name": "somethingsoff",
+  "owner": {
+    "name": "Aarman Roy",
+    "email": "mail@aarmanroy.com"
+  },
+  "metadata": {
+    "description": "Official plugin for the somethingsoff CLI: local-first log search for developers and AI coding agents"
+  },
+  "plugins": [
+    {
+      "name": "somethingsoff",
+      "source": "./claude-plugin",
+      "description": "Skill + failure hook: Claude searches your indexed logs the moment a command fails"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+[package]
+name = "somethingsoff"
+version = "0.1.0"
+edition = "2021"
+description = "When something's off, ask your logs — local-first log search for developers and AI coding agents"
+authors = ["Aarman Roy <mail@aarmanroy.com>"]
+license = "MIT"
+repository = "https://github.com/aarmanroy/somethingsoff"
+homepage = "https://github.com/aarmanroy/somethingsoff"
+readme = "README.md"
+keywords = ["logs", "search", "cli", "debugging", "observability"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+# claude-plugin/ must ship in the package: the skill is include_str!-ed at
+# build time and the plugin manifests are asserted by tests.
+exclude = [
+    "field-tests/",
+    "proptest-regressions/",
+    "scripts/",
+    ".github/",
+    "/.claude-plugin/",
+    "AGENTS.md",
+    "progress.txt",
+    "SPEC-fast-time-filters-and-errors.md",
+    "docs/RELEASE_PLAN.md",
+    "*.html",
+]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.22"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+toml = "0.8"
+dirs = "5"
+fs2 = "0.4"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+once_cell = "1.19"
+mimalloc = "0.1"
+
+[dev-dependencies]
+chrono = "0.4"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = "1.6"
+proptest-derive = "0.5"
+
+[[bench]]
+name = "log_benchmarks"
+harness = false
+
+# Ingest is allocation-heavy (per-line String work) and the CLI is invoked
+# fresh per command, so a faster steady-state binary matters. LTO + a single
+# codegen unit let the optimizer inline across crate boundaries; `strip` keeps
+# the shipped binary small.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
