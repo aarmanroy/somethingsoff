@@ -103,6 +103,18 @@ pub struct ErrorsQueryResult {
     pub groups: Vec<crate::index::aggregator::AggregatedErrorGroup>,
 }
 
+/// Result of a Drain template-mining pass.
+pub struct PatternsQueryResult {
+    /// Total matching documents (before the scan cap)
+    pub total_logs: usize,
+    /// Documents actually fed into the Drain tree
+    pub scanned: usize,
+    /// Mined templates, sorted by count descending, truncated to limit
+    pub templates: Vec<crate::drain::Cluster>,
+    /// Applied filters, for `meta.filters`
+    pub filters: serde_json::Map<String, serde_json::Value>,
+}
+
 use crate::cmd::schema::IndexStats;
 use std::collections::HashMap;
 
@@ -414,6 +426,103 @@ impl IndexSearcher {
         Ok(ErrorsQueryResult {
             total_errors,
             groups: sorted_groups,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Template mining: Drain clustering over message first-lines
+    // -----------------------------------------------------------------------
+
+    /// Mine recurring message templates from matching documents using the
+    /// Drain algorithm (`crate::drain`).
+    ///
+    /// Drain state is order-sensitive with no associative merge, so this
+    /// is collect-then-cluster rather than a custom segment collector:
+    /// fetch the newest `scan_cap` docs, then feed them to a single tree
+    /// in chronological order. When `total_logs > scanned` the caller
+    /// should attach a `sampled` notice.
+    pub fn patterns_query(
+        &self,
+        options: &SearchOptions,
+        limit: usize,
+        scan_cap: usize,
+    ) -> Result<PatternsQueryResult> {
+        let searcher = self.reader.searcher();
+        let (query, filters) = self.build_query(options)?;
+
+        let total_logs = searcher.search(&query, &Count).context("Count failed")?;
+
+        // Newest docs first: when the window exceeds the cap, the recent
+        // entries are the relevant sample.
+        let docs = searcher.search(
+            &query,
+            &TopDocs::with_limit(scan_cap.max(1)).order_by_u64_field("timestamp", Order::Desc),
+        )?;
+
+        // Read only the four fields Drain needs — no LogEntry materialization.
+        use tantivy::schema::{OwnedValue, TantivyDocument};
+        let get_text = |doc: &TantivyDocument, field: tantivy::schema::Field| -> String {
+            doc.get_first(field)
+                .and_then(|v: &OwnedValue| match v {
+                    OwnedValue::Str(s) => Some(s.clone()),
+                    OwnedValue::PreTokStr(s) => Some(s.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        struct Row {
+            timestamp: String,
+            level: String,
+            log_id: String,
+            first_line: String,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(docs.len());
+        for (_, addr) in docs {
+            let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                continue;
+            };
+            let message = get_text(&doc, self.fields.message);
+            rows.push(Row {
+                timestamp: get_text(&doc, self.fields.timestamp),
+                level: get_text(&doc, self.fields.level),
+                log_id: get_text(&doc, self.fields.log_id),
+                first_line: truncate_chars(message.lines().next().unwrap_or(""), 1000).to_string(),
+            });
+        }
+        let scanned = rows.len();
+
+        let mut tree = crate::drain::DrainTree::new(crate::drain::DrainConfig::default());
+        for row in rows.iter().rev() {
+            // rev(): oldest first — Drain learns templates chronologically
+            let masked = crate::mask::mask_extended(&row.first_line);
+            tree.observe(
+                &masked,
+                &crate::drain::Observation {
+                    timestamp: &row.timestamp,
+                    level: &row.level,
+                    log_id: &row.log_id,
+                    raw_message: &row.first_line,
+                },
+            );
+        }
+
+        let mut templates = tree.into_clusters();
+        // Count desc, then recency, then longer (more diagnostic) template,
+        // with the template string as the final total-order tie-break.
+        templates.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.last_seen.cmp(&a.last_seen))
+                .then_with(|| b.tokens.len().cmp(&a.tokens.len()))
+                .then_with(|| a.tokens.cmp(&b.tokens))
+        });
+        templates.truncate(limit);
+
+        Ok(PatternsQueryResult {
+            total_logs,
+            scanned,
+            templates,
+            filters,
         })
     }
 
@@ -761,6 +870,14 @@ pub fn parse_iso8601(s: &str) -> Result<DateTime<Utc>> {
 /// Output format: `2024-01-15T10:30:00.123Z`
 pub fn format_timestamp(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// Truncate to at most `max_chars` characters, respecting char boundaries.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 #[cfg(test)]

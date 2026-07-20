@@ -23,13 +23,21 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ingest a log file into the index
 #[derive(Args)]
 pub struct IngestCommand {
-    /// Source name for this log file (e.g., backend, frontend, telemetry)
-    #[arg(short, long)]
-    pub source: String,
-
     /// Path to the log file to ingest
+    #[arg(
+        value_name = "FILE",
+        conflicts_with = "file",
+        required_unless_present = "file"
+    )]
+    pub file_pos: Option<PathBuf>,
+
+    /// Path to the log file to ingest (same as the positional FILE)
+    #[arg(short, long, value_name = "FILE")]
+    pub file: Option<PathBuf>,
+
+    /// Source name for this log file (default: the file stem, lowercased)
     #[arg(short, long)]
-    pub file: PathBuf,
+    pub source: Option<String>,
 }
 
 impl IngestCommand {
@@ -37,16 +45,37 @@ impl IngestCommand {
         let envelope = Envelope::new("ingest");
         let config = Config::load()?;
 
-        // Validate source name (normalize to lowercase)
-        let source = self.source.to_lowercase();
-
-        // Validate file exists
-        if !self.file.exists() {
+        // Clap guarantees exactly one of positional/--file; stay total anyway.
+        let Some(file) = self.file_pos.as_ref().or(self.file.as_ref()) else {
             return Err(CliError::new(
                 ErrorCode::Usage,
-                format!("File not found: {}", self.file.display()),
+                "No file given".to_string(),
             )
-            .with_hint("Check the --file path. Files in ./logs/ are ingested automatically — no explicit ingest needed.")
+            .with_hint("Usage: somethingsoff ingest <FILE> [--source <SOURCE>]")
+            .into());
+        };
+
+        // Source name: explicit flag, or the file stem — the same name
+        // auto-discovery would give a file in ./logs/ (normalized to
+        // lowercase either way).
+        let source = self
+            .source
+            .clone()
+            .unwrap_or_else(|| {
+                file.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ingest")
+                    .to_string()
+            })
+            .to_lowercase();
+
+        // Validate file exists
+        if !file.exists() {
+            return Err(CliError::new(
+                ErrorCode::Usage,
+                format!("File not found: {}", file.display()),
+            )
+            .with_hint("Check the FILE path. Files in ./logs/ are ingested automatically — no explicit ingest needed.")
             .into());
         }
 
@@ -67,8 +96,8 @@ impl IngestCommand {
 
         // Full-file ingest from offset 0 (dedup absorbs any overlap with
         // previous ingests or auto-sync passes).
-        crate::log_info!("Ingesting {} logs from: {:?}", source, self.file);
-        let (cursor, stats) = tail::ingest_new_lines(&self.file, &source, 0, &mut writer, &fields)?;
+        crate::log_info!("Ingesting {} logs from: {:?}", source, file);
+        let (cursor, stats) = tail::ingest_new_lines(file, &source, 0, &mut writer, &fields)?;
 
         // Commit changes
         writer.commit().context("Failed to commit index")?;
@@ -84,7 +113,7 @@ impl IngestCommand {
         // Register the file so auto-sync keeps it fresh from here on.
         let mut sync_state = SyncState::load(&base_dir);
         sync_state.insert(
-            &self.file,
+            file,
             FileState {
                 source: source.clone(),
                 offset: cursor.offset,
@@ -106,7 +135,7 @@ impl IngestCommand {
         envelope.emit(
             serde_json::json!({
                 "source": source,
-                "file": self.file.display().to_string(),
+                "file": file.display().to_string(),
                 "entries_indexed": stats.indexed,
                 "entries_deduplicated": entries_deduplicated,
                 "entries_failed": stats.failed,

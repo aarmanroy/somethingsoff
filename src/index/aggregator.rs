@@ -16,7 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sha2::{Digest, Sha256};
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::StrColumn;
 use tantivy::schema::{Field, OwnedValue};
@@ -312,18 +311,18 @@ impl SegmentCollector for ErrorAggSegmentCollector {
             if error_name.is_some() || error_message.is_some() {
                 let name = error_name.as_deref().unwrap_or("Unknown");
                 let msg = error_message.as_deref().unwrap_or("");
-                let template = crate::cmd::errors::normalize_template(msg);
+                let template = crate::mask::normalize_template(msg);
                 (
-                    generate_fingerprint(name, &template),
+                    crate::mask::generate_fingerprint(name, &template),
                     template,
                     error_name,
                     error_message,
                 )
             } else {
                 // Fallback: use the log message for fingerprinting
-                let template = crate::cmd::errors::normalize_template(&message);
+                let template = crate::mask::normalize_template(&message);
                 (
-                    generate_fingerprint("Unknown", &template),
+                    crate::mask::generate_fingerprint("Unknown", &template),
                     template,
                     None,
                     Some(message),
@@ -379,17 +378,6 @@ fn get_text_field(doc: &tantivy::TantivyDocument, field: Field) -> Option<String
         OwnedValue::PreTokStr(s) => Some(s.text.clone()),
         _ => None,
     })
-}
-
-/// Generate a deterministic fingerprint from error name and message.
-/// Same algorithm as `cmd::errors::generate_fingerprint`.
-fn generate_fingerprint(name: &str, message: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    hasher.update(b"|");
-    hasher.update(message.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(&result[..8]) // First 8 bytes = 16 hex chars
 }
 
 // ---------------------------------------------------------------------------
@@ -646,21 +634,6 @@ mod tests {
             group.error_message,
             Some("Generic error occurred".to_string())
         );
-    }
-
-    #[test]
-    fn test_generate_fingerprint_deterministic() {
-        let fp1 = generate_fingerprint("TestError", "msg");
-        let fp2 = generate_fingerprint("TestError", "msg");
-        assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 16);
-    }
-
-    #[test]
-    fn test_generate_fingerprint_different() {
-        let fp1 = generate_fingerprint("TestError", "msg1");
-        let fp2 = generate_fingerprint("TestError", "msg2");
-        assert_ne!(fp1, fp2);
     }
 
     #[test]

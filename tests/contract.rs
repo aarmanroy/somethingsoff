@@ -63,6 +63,7 @@ fn test_every_command_emits_the_envelope() {
         ("get", vec!["get", "--request-id", "req-1"]),
         ("stats", vec!["stats", "--by-level"]),
         ("errors", vec!["errors", "--last", "24h"]),
+        ("patterns", vec!["patterns", "--last", "24h"]),
         ("health", vec!["health"]),
         ("schema", vec!["schema"]),
         ("index", vec!["index", "status"]),
@@ -95,6 +96,16 @@ fn test_every_command_emits_the_envelope() {
     let parsed = parse_stdout(&output.stdout);
     assert_envelope(&parsed, "ingest");
     assert_eq!(parsed["data"]["entries_indexed"], 1);
+
+    // ingest also accepts a positional FILE (source defaults to the stem)
+    let output = somethingsoff(temp.path())
+        .arg("ingest")
+        .arg(&extra)
+        .output()
+        .unwrap();
+    let parsed = parse_stdout(&output.stdout);
+    assert_envelope(&parsed, "ingest");
+    assert_eq!(parsed["data"]["source"], "extra");
 }
 
 #[test]
@@ -275,7 +286,12 @@ fn test_clap_parse_errors_follow_the_error_envelope_contract() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "usage");
     assert_eq!(value["error"]["exit_code"], 3);
-    assert!(value["error"]["hint"].as_str().unwrap().contains("--help"));
+    // The hint carries the failing subcommand's usage line so agents can
+    // self-correct without a --help round-trip.
+    assert!(value["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("Usage: somethingsoff search"));
 
     // A value that looks like a flag (real case: cargo's "--> src/..." lines
     // fed to `learn --sample`) — same contract.

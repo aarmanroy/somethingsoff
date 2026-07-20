@@ -1,6 +1,6 @@
 [package]
 name = "somethingsoff"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "When something's off, ask your logs — local-first log search for developers and AI coding agents"
 authors = ["Aarman Roy <mail@aarmanroy.com>"]

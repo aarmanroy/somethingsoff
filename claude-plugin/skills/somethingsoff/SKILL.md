@@ -2,7 +2,7 @@
 name: somethingsoff
 description: Search and analyze the project's application logs with the somethingsoff CLI. Use when debugging errors, investigating why a request failed, tracing a request ID, checking what an app logged, watching for new errors, or asking "what happened" in a dev server, backend, or test run. Also use for vague runtime-misbehavior reports — "something's broken", "it's not working", "the app is acting weird", "it crashed", "this endpoint is slow", flaky or intermittent tests, or any bug report where the cause isn't known yet. Scope, reads runtime logs only — not useful for compile errors or purely static code questions. Works with zero setup on any log format.
 metadata:
-  version: "1.2"
+  version: "1.3"
 ---
 
 # Searching application logs with somethingsoff
@@ -35,6 +35,9 @@ purely static.
 ```bash
 # What's broken right now? (grouped errors, newest window first)
 somethingsoff --quiet errors --last 1h
+
+# What is the app logging at all? (all levels, collapsed into templates)
+somethingsoff --quiet patterns --last 1h
 
 # Trace one request across all sources
 somethingsoff --quiet get --request-id req-123
@@ -79,6 +82,12 @@ time window or drop filters) · `3` usage/config · `4` index locked/corrupt ·
 - `errors` groups near-duplicate failures by masked `template`
   (`Connection timeout to db-<num> after <num>ms`) — prefer it over raw
   search when triaging; one group line replaces hundreds of entries.
+- `patterns` runs Drain clustering over **all** levels, collapsing thousands
+  of routine lines into a ranked template list with counts and `share_pct`
+  — use it to see past error-level noise and answer "what is this app doing?"
+  in one command. (`errors` fingerprints are stable across runs for tracking
+  a specific failure; `patterns` template IDs are only stable within a
+  response — a triage lens, not an identity.)
 - **Trust calibration:** `stats --by-format` shows how much of the index was
   structurally parsed vs captured as `raw` text. A high `raw` share means
   field filters (`--level`, `--request-id`, `--status`) only see part of the

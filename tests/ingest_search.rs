@@ -66,6 +66,67 @@ fn test_full_ingest_search_workflow() {
 }
 
 #[test]
+fn test_ingest_positional_file_defaults_source_to_stem() {
+    let temp_dir = TempDir::new().unwrap();
+    let base_dir = temp_dir.path();
+    let log_file_path = base_dir.join("Rclone-Hetzner.log");
+
+    let mut f = File::create(&log_file_path).unwrap();
+    writeln!(
+        f,
+        r#"{{"timestamp": "2026-03-22T10:00:00Z", "level": "info", "message": "Transferred 5 files"}}"#
+    )
+    .unwrap();
+
+    // Positional FILE, no --source: source falls back to the lowercased stem.
+    let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
+    cmd.env("SOMETHINGSOFF_BASE_DIR", base_dir)
+        .arg("ingest")
+        .arg(&log_file_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"source\":\"rclone-hetzner\""))
+        .stdout(predicate::str::contains("\"entries_indexed\":1"));
+
+    // The derived source is searchable.
+    let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
+    cmd.env("SOMETHINGSOFF_BASE_DIR", base_dir)
+        .arg("search")
+        .arg("--source")
+        .arg("rclone-hetzner")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Transferred 5 files"));
+}
+
+#[test]
+fn test_ingest_positional_and_flag_forms_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let base_dir = temp_dir.path();
+    let log_file_path = base_dir.join("app.log");
+    File::create(&log_file_path).unwrap();
+
+    // Both forms at once → usage error (exit 3, JSON envelope).
+    let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
+    cmd.env("SOMETHINGSOFF_BASE_DIR", base_dir)
+        .arg("ingest")
+        .arg(&log_file_path)
+        .arg("--file")
+        .arg(&log_file_path)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("\"code\":\"usage\""));
+
+    // Neither form → usage error whose hint shows the ingest usage line.
+    let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
+    cmd.env("SOMETHINGSOFF_BASE_DIR", base_dir)
+        .arg("ingest")
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("Usage: somethingsoff ingest"));
+}
+
+#[test]
 fn test_search_context_returns_surrounding_logs() {
     let temp_dir = TempDir::new().unwrap();
     let base_dir = temp_dir.path();

@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-07-20
+
+### Added
+
+- **`patterns`**: mine recurring message templates across all log levels
+  using a native [Drain](https://github.com/logpai/Drain3) implementation —
+  the "what is the app logging?" triage counterpart to `errors`. Collapses
+  noisy windows into a ranked list of templates (`<*>` marks generalized
+  tokens) with per-level counts, share percentages, first/last seen, and
+  sample log IDs. Templates are recomputed per query; a `sampled` notice
+  appears when only the newest 50k matching entries were scanned.
+- **`ingest` positional file argument**: `somethingsoff ingest <FILE>` now
+  works without `--file`, and `--source` defaults to the lowercased file
+  stem.
+
+### Changed
+
+- Clap usage errors now surface the failing subcommand's usage line in the
+  error hint, so agents can self-correct without a `--help` round-trip.
+
 ## [0.1.0] - 2026-07-17
 
 First public release.

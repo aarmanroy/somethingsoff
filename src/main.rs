@@ -16,7 +16,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use somethingsoff::cmd::{
     ClaudeCommand, ErrorsCommand, GetCommand, HealthCommand, IndexCommand, IngestCommand,
-    LearnCommand, SchemaCommand, SearchCommand, StatsCommand, TapCommand, WatchCommand,
+    LearnCommand, PatternsCommand, SchemaCommand, SearchCommand, StatsCommand, TapCommand,
+    WatchCommand,
 };
 use somethingsoff::output::OutputFormat;
 
@@ -37,6 +38,7 @@ Project state lives in ./.somethingsoff/ (index, sync cursors, config).
 QUICK START:
   somethingsoff search --level error --last 24h
   somethingsoff errors --last 1h            # grouped error analysis
+  somethingsoff patterns --last 1h          # what is the app logging?
   somethingsoff get --request-id req-123    # trace one request
   somethingsoff stats --by-level --by-route
   somethingsoff search -q \"connection refused\" --context 5
@@ -96,6 +98,8 @@ enum Commands {
     Stats(StatsCommand),
     /// Aggregate and analyze error logs
     Errors(ErrorsCommand),
+    /// Mine recurring message templates (Drain clustering)
+    Patterns(PatternsCommand),
     /// Check system and index health
     Health(HealthCommand),
     /// Manage the search index
@@ -122,6 +126,7 @@ impl Commands {
             Commands::Get(_) => "get",
             Commands::Stats(_) => "stats",
             Commands::Errors(_) => "errors",
+            Commands::Patterns(_) => "patterns",
             Commands::Health(_) => "health",
             Commands::Index(_) => "index",
             Commands::Ingest(_) => "ingest",
@@ -146,21 +151,54 @@ async fn main() -> Result<()> {
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
                 e.exit(); // help/version are not errors
             }
-            let message = e
-                .to_string()
+            let rendered = e.to_string();
+            // First line plus any indented continuation ("the following
+            // required arguments were not provided:" lists them below).
+            let mut message = rendered
                 .lines()
                 .next()
                 .unwrap_or("invalid arguments")
                 .trim_start_matches("error: ")
                 .to_string();
+            for cont in rendered
+                .lines()
+                .skip(1)
+                .take_while(|l| l.starts_with(' ') && !l.trim().is_empty())
+            {
+                message.push(' ');
+                message.push_str(cont.trim());
+            }
+            // Surface the failing subcommand's usage line in the hint so
+            // agents can self-correct without a --help round-trip. Clap
+            // wraps long usage lines; continuation lines are indented.
+            let usage = {
+                let mut lines = rendered
+                    .lines()
+                    .skip_while(|l| !l.trim_start().starts_with("Usage:"));
+                lines.next().map(|first| {
+                    let mut usage = first.trim().to_string();
+                    for cont in lines.take_while(|l| {
+                        l.starts_with(' ') && !l.trim().is_empty() && !l.contains("For more")
+                    }) {
+                        usage.push(' ');
+                        usage.push_str(cont.trim());
+                    }
+                    usage
+                })
+            };
+            let hint = match usage {
+                Some(usage) => {
+                    format!("{usage}. Pass values starting with '-' as --flag=value.")
+                }
+                None => "Run `somethingsoff --help` for usage. Pass values starting with '-' \
+                         as --flag=value."
+                    .to_string(),
+            };
             let cli_error = somethingsoff::output::CliError::new(
                 somethingsoff::output::ErrorCode::Usage,
                 message,
             )
-            .with_hint(
-                "Run `somethingsoff --help` for usage. Pass values starting with '-' \
-                         as --flag=value.",
-            );
+            .with_hint(&hint);
             println!("{}", somethingsoff::output::render_error("cli", &cli_error));
             std::process::exit(cli_error.code.exit_code());
         }
@@ -177,6 +215,7 @@ async fn main() -> Result<()> {
         Commands::Get(cmd) => cmd.execute().await,
         Commands::Stats(cmd) => cmd.execute().await,
         Commands::Errors(cmd) => cmd.execute().await,
+        Commands::Patterns(cmd) => cmd.execute().await,
         Commands::Health(cmd) => cmd.execute(),
         Commands::Index(cmd) => cmd.execute().await,
         Commands::Ingest(cmd) => cmd.execute().await,

@@ -41,7 +41,7 @@ breaking changes and require a major version bump.
 }
 ```
 
-- `sync` present only on read commands (search/get/stats/errors/schema/health).
+- `sync` present only on read commands (search/get/stats/errors/patterns/schema/health).
   `reason` ∈ `"fresh" | "locked" | "disabled"` when `skipped` is true.
   `migrated` appears (true) only when a schema upgrade rebuilt the index.
 - `meta` present on list-shaped responses:
@@ -50,7 +50,7 @@ breaking changes and require a major version bump.
   applied filters as a snake_case object.
 - `notices` omitted when empty. Notable codes: `sync_deferred` (lock held,
   results possibly ~2s stale), `index_migrated`, `sampled` (schema profile
-  computed from a capped sample), `gitignore_updated`.
+  or patterns templates computed from a capped sample), `gitignore_updated`.
 
 ### `data` per command
 
@@ -60,6 +60,7 @@ breaking changes and require a major version bump.
 | `get` | `{results: [entry…]}` |
 | `stats` | `{total_logs, by_level?, by_route?, by_user?, by_format?}` |
 | `errors` | `{total_errors, total_groups, groups: [{fingerprint, error_name, error_message, template, count, affected_users, first_seen, last_seen, sample_log_ids}]}` |
+| `patterns` | `{total_logs, scanned, total_templates, templates: [{template_id, template, count, share_pct, first_seen, last_seen, sample_message, sample_log_ids, levels}]}` — `template_id` (`"v1:" + sha256 prefix`) is stable for a given template string, but Drain clustering is corpus-dependent: a different window can mine different templates for the same message. For cross-run identity use the `errors` fingerprint. A `sampled` notice appears when only the newest 50k matching entries were scanned. |
 | `health` | `{status: "healthy"\|"degraded"\|"unhealthy", checks: [{name, status, details, data?}]}` |
 | `schema` | `{index_path, system_info, schema: {version, fields: [{name, type, count, cardinality, samples}], index_stats, supported_time_formats}}` |
 | `index` | `{action: "rebuild"\|"status"\|"clean", …}` |
@@ -146,7 +147,7 @@ next command or flag. `code` values:
 | code | meaning |
 |---|---|
 | 0 | success, results present |
-| 2 | success, **zero results** (search/get/stats/errors/learn) — not a failure |
+| 2 | success, **zero results** (search/get/stats/errors/patterns/learn) — not a failure |
 | 3 | usage or configuration error (`usage`, `config_invalid`, `no_sources`) |
 | 4 | index error (`index_locked`, `index_corrupt`) |
 | 5 | permission / disk / IO (`permission_denied`, `io_error`) |

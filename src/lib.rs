@@ -1,7 +1,9 @@
 pub mod cmd;
 pub mod config;
+pub mod drain;
 pub mod error;
 pub mod index;
+pub mod mask;
 pub mod output;
 pub mod parser;
 pub mod pii;
