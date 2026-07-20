@@ -318,7 +318,10 @@ mod tests {
         // "alpha beta a b c" vs "alpha gamma ..." routes elsewhere; use
         // sub-threshold within the same leaf instead: 1/5 shared tail.
         let mut tree = DrainTree::new(DrainConfig::default());
-        observe_all(&mut tree, &["alpha beta one two three", "alpha beta x y three"]);
+        observe_all(
+            &mut tree,
+            &["alpha beta one two three", "alpha beta x y three"],
+        );
         // 3/5 = 0.6 merges; then "alpha beta p q r" vs "<*> generalized"
         // template "alpha beta <*> <*> three": 2/5 literal + wildcards.
         assert_eq!(tree.into_clusters().len(), 1);
@@ -399,10 +402,22 @@ mod tests {
     #[test]
     fn test_metadata_aggregation() {
         let mut tree = DrainTree::new(DrainConfig::default());
-        tree.observe("disk sync failed", &obs("2026-07-20T02:00:00Z", "error", "id2"));
-        tree.observe("disk sync failed", &obs("2026-07-20T01:00:00Z", "warn", "id1"));
-        tree.observe("disk sync failed", &obs("2026-07-20T03:00:00Z", "error", "id3"));
-        tree.observe("disk sync failed", &obs("2026-07-20T04:00:00Z", "error", "id4"));
+        tree.observe(
+            "disk sync failed",
+            &obs("2026-07-20T02:00:00Z", "error", "id2"),
+        );
+        tree.observe(
+            "disk sync failed",
+            &obs("2026-07-20T01:00:00Z", "warn", "id1"),
+        );
+        tree.observe(
+            "disk sync failed",
+            &obs("2026-07-20T03:00:00Z", "error", "id3"),
+        );
+        tree.observe(
+            "disk sync failed",
+            &obs("2026-07-20T04:00:00Z", "error", "id4"),
+        );
         let clusters = tree.into_clusters();
         assert_eq!(clusters.len(), 1);
         let c = &clusters[0];

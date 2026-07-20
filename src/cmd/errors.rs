@@ -111,4 +111,3 @@ impl ErrorsCommand {
         Ok(if total_errors == 0 { 2 } else { 0 })
     }
 }
-

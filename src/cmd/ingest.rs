@@ -47,12 +47,9 @@ impl IngestCommand {
 
         // Clap guarantees exactly one of positional/--file; stay total anyway.
         let Some(file) = self.file_pos.as_ref().or(self.file.as_ref()) else {
-            return Err(CliError::new(
-                ErrorCode::Usage,
-                "No file given".to_string(),
-            )
-            .with_hint("Usage: somethingsoff ingest <FILE> [--source <SOURCE>]")
-            .into());
+            return Err(CliError::new(ErrorCode::Usage, "No file given".to_string())
+                .with_hint("Usage: somethingsoff ingest <FILE> [--source <SOURCE>]")
+                .into());
         };
 
         // Source name: explicit flag, or the file stem — the same name
