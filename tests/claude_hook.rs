@@ -1,10 +1,10 @@
 //! Integration tests for `somethingsoff claude hook` — the Claude Code
-//! PostToolUseFailure hook entrypoint.
+//! PostToolUseFailure and PreToolUse hook entrypoint.
 //!
 //! Contract under test: stdin gets a hook event JSON; stdout gets either
-//! exactly one hook response JSON line (`hookSpecificOutput.additionalContext`)
-//! or nothing; the exit code is always 0. Payload fixtures mirror real
-//! events captured from Claude Code (2026-07-17).
+//! exactly one hook response JSON line (`hookSpecificOutput`) or nothing;
+//! the exit code is always 0. Payload fixtures mirror real events captured
+//! from Claude Code (2026-07-17).
 
 use assert_cmd::Command;
 use std::fs;
@@ -226,6 +226,116 @@ fn test_malformed_and_empty_stdin_are_silent() {
     let temp = TempDir::new().unwrap();
     assert_silent(&run_hook(temp.path(), "not json {{{"));
     assert_silent(&run_hook(temp.path(), ""));
+}
+
+// --- PreToolUse: answer instead of letting the raw file through ----------
+
+/// A `PreToolUse` payload as Claude Code sends it for a Bash call.
+fn pre_payload(cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": cwd.to_string_lossy(),
+        "tool_input": {"command": command, "description": "test"},
+    })
+    .to_string()
+}
+
+fn parse_deny(output: &std::process::Output) -> String {
+    assert!(output.status.success(), "hook must always exit 0");
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(raw.trim())
+        .unwrap_or_else(|e| panic!("hook stdout must be one JSON doc ({e}): {raw}"));
+    assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+    parsed["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("permissionDecisionReason missing")
+        .to_string()
+}
+
+#[test]
+fn test_reading_an_indexed_log_is_denied_with_the_answer() {
+    let temp = TempDir::new().unwrap();
+    seed_indexed_errors(temp.path());
+
+    let output = run_hook(temp.path(), &pre_payload(temp.path(), "cat logs/app.json"));
+    let reason = parse_deny(&output);
+
+    // The reason *is* the answer: the query already ran.
+    assert!(reason.contains("Payment gateway gw-<num> timeout after <num>ms"));
+    assert!(reason.contains("logs/app.json"));
+    // Both follow-ups, and the escape hatch.
+    assert!(reason.contains("somethingsoff --quiet errors --last 1h"));
+    assert!(reason.contains("somethingsoff --quiet search --last 1h -n 50 --compact"));
+    assert!(reason.contains("Re-run this exact command"));
+}
+
+#[test]
+fn test_repeating_a_denied_command_is_allowed_through() {
+    // The escape hatch must be real: a hook may never trap the agent.
+    let temp = TempDir::new().unwrap();
+    seed_indexed_errors(temp.path());
+    let payload = pre_payload(temp.path(), "cat logs/app.json");
+
+    parse_deny(&run_hook(temp.path(), &payload)); // denied once
+    assert_silent(&run_hook(temp.path(), &payload)); // retry runs
+}
+
+#[test]
+fn test_reading_a_non_log_file_is_allowed() {
+    let temp = TempDir::new().unwrap();
+    seed_indexed_errors(temp.path());
+    for command in ["cat README.md", "cat package.json", "npm test"] {
+        assert_silent(&run_hook(temp.path(), &pre_payload(temp.path(), command)));
+    }
+}
+
+#[test]
+fn test_pre_tool_use_without_an_index_is_allowed() {
+    // No index: nothing to offer, and a hook must not build one.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("logs")).unwrap();
+    fs::write(temp.path().join("logs/app.log"), "ERROR boom\n").unwrap();
+
+    let output = run_hook(temp.path(), &pre_payload(temp.path(), "cat logs/app.log"));
+    assert_silent(&output);
+    assert!(
+        !temp.path().join(".somethingsoff/index").exists(),
+        "hook must not create the index"
+    );
+}
+
+#[test]
+fn test_pre_tool_use_with_a_quiet_window_is_allowed() {
+    // Indexed, but no errors in the window: the raw file is still the
+    // better answer, so don't block it.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("logs")).unwrap();
+    fs::write(
+        temp.path().join("logs/app.json"),
+        "{\"timestamp\":\"2020-01-01T00:00:00Z\",\"level\":\"error\",\"message\":\"ancient failure\"}\n",
+    )
+    .unwrap();
+    somethingsoff(temp.path())
+        .args(["--quiet", "errors", "--last", "1h"])
+        .assert()
+        .code(2);
+
+    assert_silent(&run_hook(
+        temp.path(),
+        &pre_payload(temp.path(), "cat logs/app.json"),
+    ));
+}
+
+#[test]
+fn test_pre_tool_use_never_intercepts_our_own_commands() {
+    let temp = TempDir::new().unwrap();
+    seed_indexed_errors(temp.path());
+    assert_silent(&run_hook(
+        temp.path(),
+        &pre_payload(temp.path(), "somethingsoff --quiet search --last 1h"),
+    ));
 }
 
 // --- Plugin drift guards -------------------------------------------------
