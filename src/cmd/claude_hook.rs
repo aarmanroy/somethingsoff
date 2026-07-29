@@ -1,16 +1,24 @@
 //! Claude Code hook entrypoint: `somethingsoff claude hook`.
 //!
-//! The bundled plugin (`claude-plugin/hooks/hooks.json`) runs this on
-//! `PostToolUseFailure` for Bash tool calls. Stdin is Claude Code's hook
-//! event JSON; stdout is an optional hook response whose
-//! `additionalContext` points Claude at the log evidence for the failure —
-//! ideally the actual top error group from the freshly synced index.
+//! The bundled plugin (`claude-plugin/hooks/hooks.json`) runs this on two
+//! Bash tool events. Stdin is Claude Code's hook event JSON; stdout is an
+//! optional hook response.
+//!
+//! - `PostToolUseFailure` — after a command fails, `additionalContext`
+//!   points Claude at the log evidence, ideally the actual top error group
+//!   from the freshly synced index.
+//! - `PreToolUse` — before a command that hand-reads an indexed log file
+//!   (`cat logs/app.log`), `permissionDecision: deny` returns the indexed
+//!   answer as the reason. The query has already run, so Claude gets the
+//!   answer instead of a suggestion to go find it.
 //!
 //! This command is exempt from the v1 output envelope (see
 //! docs/CONTRACT.md): its stdout belongs to Claude Code's hook protocol.
 //! A hook must never become noise, so every path that can't produce a
 //! useful suggestion exits 0 silently — malformed payloads, missing state,
-//! query errors, and timeouts included.
+//! query errors, and timeouts included. For `PreToolUse` that rule is
+//! stronger: silence means the command runs untouched, so a hook that
+//! can't beat the raw file never blocks it.
 
 use std::io::Read;
 use std::path::Path;
@@ -25,8 +33,11 @@ use crate::index::searcher::SearchOptions;
 /// Failing commands can embed sizable build output in the payload's
 /// `error` field; accept real-world payloads but stay bounded.
 const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024;
-/// Time window the hook queries — and tells Claude to query.
+/// Time window the failure hook queries — and tells Claude to query.
 const LOOKBACK: &str = "15m";
+/// Window the `PreToolUse` answer summarises. Wider than `LOOKBACK`: a
+/// `cat logs/app.log` isn't scoped to a command that just ran.
+const PRE_LOOKBACK: &str = "1h";
 /// Error groups fetched for the summary (only the top one is named).
 const TOP_GROUPS: usize = 3;
 /// Same-fingerprint suggestions are suppressed for this long.
@@ -35,8 +46,21 @@ const RATE_LIMIT: Duration = Duration::from_secs(300);
 const QUERY_BUDGET: Duration = Duration::from_secs(3);
 /// Ceiling for the injected context — hooks should be cheap in tokens.
 const MAX_CONTEXT_CHARS: usize = 600;
+/// Ceiling for a deny reason. Slightly wider than `MAX_CONTEXT_CHARS`
+/// because the reason also carries the replacement commands and the
+/// escape hatch; capping the template keeps it far below this in practice.
+const MAX_REASON_CHARS: usize = 700;
 /// Longest masked template quoted inside the context.
 const MAX_TEMPLATE_CHARS: usize = 160;
+
+/// Commands that dump a file's contents. `tail -f` is included on
+/// purpose: following a log by hand is what `watch`/`tap` exist for.
+const FILE_READERS: [&str; 11] = [
+    "cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag",
+];
+/// Extensions that mean "log file" outside `./logs/`. `.json` is
+/// deliberately absent — `package.json` is not a log.
+const LOG_FILE_EXTENSIONS: [&str; 2] = [".log", ".jsonl"];
 
 /// The subset of Claude Code's hook event payload the hook cares about.
 /// Every field is optional-with-default: an unexpected shape must degrade
@@ -68,6 +92,10 @@ struct ToolInput {
 struct HookState {
     last_fired_unix: u64,
     last_fingerprint: String,
+    /// `PreToolUse` denials are tracked separately so the two events
+    /// sharing this file can never suppress each other.
+    last_pre_denied_unix: u64,
+    last_pre_fingerprint: String,
 }
 
 /// Entry point. Infallible by design: always exits 0, prints either one
@@ -78,10 +106,10 @@ pub async fn run() -> u8 {
     let Some(payload) = read_payload() else {
         return 0;
     };
-    let Some(exit_code) = detect_failure(&payload) else {
+    if payload.tool_name != "Bash" {
         return 0;
-    };
-    // Never nag about our own invocations (including the skill's recipes).
+    }
+    // Never act on our own invocations (including the skill's recipes).
     if payload.tool_input.command.contains(env!("CARGO_PKG_NAME")) {
         return 0;
     }
@@ -90,21 +118,80 @@ pub async fn run() -> u8 {
         return 0;
     }
 
+    if payload.hook_event_name == "PreToolUse" {
+        return run_pre_tool_use(&payload).await;
+    }
+    run_post_failure(&payload).await
+}
+
+/// After a failed command: point Claude at the evidence.
+async fn run_post_failure(payload: &HookPayload) -> u8 {
+    let Some(exit_code) = detect_failure(payload) else {
+        return 0;
+    };
     let Some((context, fingerprint)) = build_context(exit_code).await else {
         return 0;
     };
     if rate_limited(&payload.cwd, &fingerprint) {
         return 0;
     }
-
-    let response = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": payload.hook_event_name,
-            "additionalContext": context,
-        }
-    });
-    println!("{}", response);
+    emit(
+        &payload.hook_event_name,
+        serde_json::json!({ "additionalContext": context }),
+    );
     0
+}
+
+/// Before a command that hand-reads an indexed log: answer from the index
+/// instead of letting the raw file into the context window.
+///
+/// The rule is deliberately narrow — a reader command (`cat`, `tail`,
+/// `grep`, …) pointed at a path this project already indexes. Everything
+/// else runs untouched, and a deny is only emitted when the index has
+/// something better to say than the file does.
+async fn run_pre_tool_use(payload: &HookPayload) -> u8 {
+    let Ok(config) = Config::load() else {
+        return 0;
+    };
+    // Same rule as the failure hook: never trigger a first-ever ingest
+    // from inside a hook. With no index there is nothing to offer.
+    if !config.index_dir().exists() {
+        return 0;
+    }
+    let Some(path) = reads_indexed_logs(&payload.tool_input.command, &config) else {
+        return 0;
+    };
+    let Some(reason) = deny_reason(&path).await else {
+        return 0;
+    };
+    // An immediate repeat of the same command is always allowed through:
+    // having seen the indexed answer, Claude may still want the raw bytes,
+    // and a hook must never trap the agent in a deny loop.
+    if pre_deny_suppressed(&payload.cwd, &payload.tool_input.command) {
+        return 0;
+    }
+    emit(
+        &payload.hook_event_name,
+        serde_json::json!({
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }),
+    );
+    0
+}
+
+/// One hook response line on stdout: `fields` merged into
+/// `hookSpecificOutput` alongside the event name.
+fn emit(event: &str, fields: serde_json::Value) {
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "hookEventName".to_string(),
+        serde_json::Value::String(event.to_string()),
+    );
+    if let serde_json::Value::Object(map) = fields {
+        output.extend(map);
+    }
+    println!("{}", serde_json::json!({ "hookSpecificOutput": output }));
 }
 
 fn read_payload() -> Option<HookPayload> {
@@ -180,7 +267,7 @@ async fn build_context(exit_code: Option<i32>) -> Option<(String, String)> {
     let has_logs = logs_dir_has_files();
 
     if has_index {
-        let query = tokio::task::spawn_blocking(query_recent_errors);
+        let query = tokio::task::spawn_blocking(|| query_recent_errors(LOOKBACK));
         match tokio::time::timeout(QUERY_BUDGET, query).await {
             Ok(Ok(Some((total, group)))) => {
                 return Some(live_context(exit_code, total, &group));
@@ -205,6 +292,105 @@ fn logs_dir_has_files() -> bool {
         .unwrap_or(false)
 }
 
+/// Does this command hand-read a file this project indexes? Returns the
+/// matched path, for naming in the deny reason.
+///
+/// Word splitting is intentionally naive. The goal is to recognise the
+/// handful of shapes an agent actually types — `cat logs/app.log`,
+/// `tail -n 200 logs/app.log`, `grep -r boom logs/` — not to parse bash.
+/// Anything unrecognised falls through and runs, which is the safe way to
+/// be wrong.
+fn reads_indexed_logs(command: &str, config: &Config) -> Option<String> {
+    for segment in split_segments(command) {
+        let mut tokens = segment.split_whitespace();
+        let Some(program) = tokens.next() else {
+            continue;
+        };
+        // `/bin/cat` and `cat` are the same command.
+        let program = program.rsplit('/').next().unwrap_or(program);
+        if !FILE_READERS.contains(&program) {
+            continue;
+        }
+        for token in tokens {
+            if token.starts_with('-') {
+                continue;
+            }
+            let candidate = token.trim_matches(['"', '\'']);
+            if is_indexed_path(candidate, config) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Split on the shell operators that separate commands, so a reader
+/// hidden behind a pipe or `&&` is still seen.
+fn split_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['|', ';', '\n'])
+        .flat_map(|segment| segment.split("&&"))
+        .collect()
+}
+
+/// Is this path one the index already covers? Three ways to qualify: the
+/// zero-config `./logs/` convention, a log extension anywhere, or an
+/// explicitly configured source.
+fn is_indexed_path(candidate: &str, config: &Config) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    let path = candidate.trim_start_matches("./");
+
+    let logs_dir = crate::sync::discover::LOGS_DIR;
+    if path == logs_dir
+        || path.starts_with(&format!("{}/", logs_dir))
+        || path.contains(&format!("/{}/", logs_dir))
+    {
+        return true;
+    }
+    if LOG_FILE_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return true;
+    }
+    config.log_sources.values().any(|source| {
+        let source = source.trim_start_matches("./");
+        !source.is_empty() && path.starts_with(source)
+    })
+}
+
+/// The indexed answer, or `None` when there isn't one worth blocking for
+/// (nothing in the window, or the query blew its budget).
+async fn deny_reason(path: &str) -> Option<String> {
+    let query = tokio::task::spawn_blocking(|| query_recent_errors(PRE_LOOKBACK));
+    let (total, top) = match tokio::time::timeout(QUERY_BUDGET, query).await {
+        Ok(Ok(Some(found))) => found,
+        _ => return None,
+    };
+
+    let name = env!("CARGO_PKG_NAME");
+    let reason = format!(
+        "`{}` is indexed by {}; reading it raw floods the context window. \
+         Already queried for you — last {}: {} error entr{}, \
+         top group \"{}\" ({}×, last seen {}). \
+         Full breakdown: `{} --quiet errors --last {}`. \
+         Bounded raw lines: `{} --quiet search --last {} -n 50 --compact`. \
+         Re-run this exact command to read the file anyway.",
+        path,
+        name,
+        PRE_LOOKBACK,
+        total,
+        if total == 1 { "y" } else { "ies" },
+        truncate_chars(&top.template, MAX_TEMPLATE_CHARS),
+        top.count,
+        top.last_seen,
+        name,
+        PRE_LOOKBACK,
+        name,
+        PRE_LOOKBACK,
+    );
+    Some(truncate_chars(&reason, MAX_REASON_CHARS))
+}
+
 struct TopGroup {
     template: String,
     count: usize,
@@ -216,12 +402,12 @@ struct TopGroup {
 ///
 /// Deliberately NOT `ErrorsCommand::execute()` — that prints the v1
 /// envelope to stdout, which would corrupt the hook response.
-fn query_recent_errors() -> Option<(usize, TopGroup)> {
+fn query_recent_errors(lookback: &str) -> Option<(usize, TopGroup)> {
     let config = Config::load().ok()?;
     let (searcher, _report) = crate::cmd::prepare_read(config).ok()?;
     let options = SearchOptions {
         level: Some("error".to_string()),
-        last: Some(LOOKBACK.to_string()),
+        last: Some(lookback.to_string()),
         ..Default::default()
     };
     let result = searcher.errors_query(&options, TOP_GROUPS).ok()?;
@@ -306,6 +492,25 @@ fn rate_limited(cwd: &str, fingerprint: &str) -> bool {
 
     state.last_fired_unix = now;
     state.last_fingerprint = fingerprint.to_string();
+    save_state(&path, &state);
+    false
+}
+
+/// A given command is denied at most once per `RATE_LIMIT`; the retry
+/// runs. Records the deny as a side effect when not suppressed.
+fn pre_deny_suppressed(cwd: &str, command: &str) -> bool {
+    let path = state_path(cwd);
+    let mut state = load_state(&path);
+    let now = now_unix();
+    let fingerprint = hex::encode(&sha2::Sha256::digest(command.as_bytes())[..8]);
+
+    let within_window = now.saturating_sub(state.last_pre_denied_unix) < RATE_LIMIT.as_secs();
+    if within_window && state.last_pre_fingerprint == fingerprint {
+        return true;
+    }
+
+    state.last_pre_denied_unix = now;
+    state.last_pre_fingerprint = fingerprint;
     save_state(&path, &state);
     false
 }
@@ -414,6 +619,69 @@ mod tests {
         assert_eq!(detect_failure(&payload), Some(Some(2)));
         payload.tool_response = serde_json::json!({"exit_code": 0});
         assert_eq!(detect_failure(&payload), None);
+    }
+
+    #[test]
+    fn test_detects_hand_reading_of_indexed_logs() {
+        let config = Config::default();
+        for command in [
+            "cat logs/app.log",
+            "cat ./logs/app.log",
+            "tail -n 200 logs/app.log",
+            "tail -f logs/app.log",
+            "head -20 logs/app.jsonl",
+            "grep -r boom logs/",
+            "less logs/app.log",
+            "/bin/cat logs/app.log",
+            "rg timeout logs/app.log",
+            "cat \"logs/app.log\"",
+            "cat .somethingsoff/streams/web.jsonl",
+        ] {
+            assert!(
+                reads_indexed_logs(command, &config).is_some(),
+                "should intercept: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ordinary_commands_run_untouched() {
+        let config = Config::default();
+        for command in [
+            "cat README.md",
+            "cat package.json", // a .json file is not a log
+            "cat src/main.rs",
+            "grep -r todo src/",
+            "head -5 Cargo.toml",
+            "npm test",
+            "echo hi > logs/app.log", // writing, not reading
+        ] {
+            assert_eq!(
+                reads_indexed_logs(command, &config),
+                None,
+                "should run untouched: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reader_behind_a_pipe_or_conjunction_is_seen() {
+        let config = Config::default();
+        assert!(reads_indexed_logs("npm test && cat logs/app.log", &config).is_some());
+        assert!(reads_indexed_logs("ls -la | grep x; tail logs/app.log", &config).is_some());
+    }
+
+    #[test]
+    fn test_configured_source_outside_logs_dir_counts() {
+        let mut config = Config::default();
+        config
+            .log_sources
+            .insert("api".to_string(), "var/output.txt".to_string());
+        assert_eq!(
+            reads_indexed_logs("cat var/output.txt", &config).as_deref(),
+            Some("var/output.txt")
+        );
+        assert_eq!(reads_indexed_logs("cat var/other.txt", &config), None);
     }
 
     #[test]
