@@ -296,29 +296,41 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Records the fire as a side effect when not suppressed.
 fn rate_limited(cwd: &str, fingerprint: &str) -> bool {
     let path = state_path(cwd);
-    let now = SystemTime::now()
+    let mut state = load_state(&path);
+    let now = now_unix();
+
+    let within_window = now.saturating_sub(state.last_fired_unix) < RATE_LIMIT.as_secs();
+    if within_window && state.last_fingerprint == fingerprint {
+        return true;
+    }
+
+    state.last_fired_unix = now;
+    state.last_fingerprint = fingerprint.to_string();
+    save_state(&path, &state);
+    false
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
 
-    if let Some(state) = std::fs::read_to_string(&path)
+/// Read-modify-write, so hooks for different events can share one file
+/// without clobbering each other's fields. A missing or corrupt file is
+/// indistinguishable from "no state yet".
+fn load_state(path: &Path) -> HookState {
+    std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<HookState>(&raw).ok())
-    {
-        let within_window = now.saturating_sub(state.last_fired_unix) < RATE_LIMIT.as_secs();
-        if within_window && state.last_fingerprint == fingerprint {
-            return true;
-        }
-    }
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
 
-    let state = HookState {
-        last_fired_unix: now,
-        last_fingerprint: fingerprint.to_string(),
-    };
-    if let Ok(raw) = serde_json::to_string(&state) {
-        let _ = std::fs::write(&path, raw);
+fn save_state(path: &Path, state: &HookState) {
+    if let Ok(raw) = serde_json::to_string(state) {
+        let _ = std::fs::write(path, raw);
     }
-    false
 }
 
 /// Per-project state file in the OS temp dir (never in the project).
