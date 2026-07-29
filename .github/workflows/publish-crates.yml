@@ -8,6 +8,15 @@ name: publish-crates
 on:
   release:
     types: [published]
+  # The `release` trigger above does not actually fire: dist creates the
+  # GitHub Release with the default GITHUB_TOKEN, and events raised by that
+  # token never start a new workflow run. 0.1.0 and 0.2.0 were both
+  # published by hand as a result. Until that is rewired, run this manually
+  # after the Release workflow goes green:
+  #   gh workflow run publish-crates.yml --ref main
+  # `.github/` is excluded from the package, so dispatching from main
+  # produces a byte-identical tarball to the tag.
+  workflow_dispatch:
 
 jobs:
   publish:
