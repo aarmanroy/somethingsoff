@@ -38,7 +38,11 @@ Make Claude reach for your logs the moment a command fails. This repo is a plugi
 The plugin ships two things:
 
 - **The `/somethingsoff` skill** — teaches Claude the CLI, the output contract, and when to check logs first ("something's off with the app" is literally in its trigger vocabulary). Type `/somethingsoff` to invoke it explicitly, or let Claude reach for it on its own.
-- **A failure hook** — when a Bash command fails in a session, the hook queries your index in-process and injects the *actual* top error group into Claude's context: `"Payment gateway gw-<num> timeout after <num>ms" (6×, last seen 09:35)`. Evidence at the exact moment debugging starts. Silent when there's nothing useful to say, rate-limited, and it never runs a first-time ingest on its own.
+- **Two hooks** — both query your index in-process and hand Claude the *actual* evidence, not a suggestion to go look for it.
+  - *On failure:* when a Bash command fails, the top error group is injected into Claude's context: `"Payment gateway gw-<num> timeout after <num>ms" (6×, last seen 09:35)`. Evidence at the exact moment debugging starts.
+  - *Before a raw read:* when Claude reaches for `cat logs/app.log` (or `tail`, `grep`, …), the command is intercepted and the indexed answer comes back instead — the query already ran. Your context window never sees the raw file.
+
+  Both are silent when there's nothing useful to say, rate-limited, and neither runs a first-time ingest on its own. A denied read always runs if Claude repeats it, so the raw file is never out of reach.
 
 No plugin? `somethingsoff claude install` writes the same skill to `.claude/skills/` (or `--global`) — offline, no marketplace. Pick one path, not both.
 

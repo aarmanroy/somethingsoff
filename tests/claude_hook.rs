@@ -361,13 +361,19 @@ fn test_plugin_hooks_config_invokes_this_binary() {
     let raw = fs::read_to_string(&hooks).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
-    let entries = parsed["hooks"]["PostToolUseFailure"].as_array().unwrap();
-    assert_eq!(entries[0]["matcher"], "Bash");
-    let command = entries[0]["hooks"][0]["command"].as_str().unwrap();
-    assert!(command.contains(concat!(env!("CARGO_PKG_NAME"), " claude hook")));
-    // Graceful degradation when the binary isn't installed.
-    assert!(command.contains("command -v"));
-    assert!(command.ends_with("|| true"));
+    // Both events route to the same entrypoint; it dispatches on
+    // hook_event_name.
+    for event in ["PreToolUse", "PostToolUseFailure"] {
+        let entries = parsed["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("{event} not registered"));
+        assert_eq!(entries[0]["matcher"], "Bash");
+        let command = entries[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains(concat!(env!("CARGO_PKG_NAME"), " claude hook")));
+        // Graceful degradation when the binary isn't installed.
+        assert!(command.contains("command -v"));
+        assert!(command.ends_with("|| true"));
+    }
 }
 
 #[test]

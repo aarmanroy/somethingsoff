@@ -2,7 +2,7 @@
   "name": "somethingsoff",
   "displayName": "somethingsoff",
   "version": "0.2.0",
-  "description": "Local-first log search for debugging: a skill that teaches Claude the CLI, plus a hook that surfaces indexed log errors the moment a command fails",
+  "description": "Local-first log search for debugging: a skill that teaches Claude the CLI, plus hooks that answer from the index when a command fails or when Claude reaches for a raw log file",
   "author": {
     "name": "Aarman Roy",
     "email": "mail@aarmanroy.com"

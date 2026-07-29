@@ -1,6 +1,18 @@
 {
-  "description": "When a Bash command fails, inject the project's indexed log evidence (top error group) into Claude's context",
+  "description": "Answer log questions from the index: intercept hand-reading of an indexed log file (PreToolUse) and inject the project's log evidence when a Bash command fails (PostToolUseFailure)",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v somethingsoff >/dev/null 2>&1 && somethingsoff claude hook || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUseFailure": [
       {
         "matcher": "Bash",
