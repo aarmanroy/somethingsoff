@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-07-30
+
+### Added
+
+- **`PreToolUse` hook — the indexed answer instead of the raw log.** When
+  Claude reaches for a log this project indexes (`cat logs/app.log`,
+  `tail -f`, `grep`, or the `Read` tool), the hook has *already run the
+  query* and returns the result as the denial reason: error count for the
+  last hour, the top group's masked template, its count and last-seen time,
+  and the exact follow-up commands. On a 43 KB dev-server log that is
+  ~10,600 tokens of raw text replaced by ~140 — with the actual failing
+  function named. Measured across Python, Node, Go, Rust, nginx, Docker and
+  Java logs: 95–98% of the context saved.
+
+  It is deliberately hard to trigger, because a hook that interrupts
+  wrongly is worse than no hook:
+
+  - **Only real sources.** Paths are resolved through the same discovery
+    the sync engine uses, so `/var/log/system.log`, `npm-debug.log` and
+    anything else this project doesn't index runs untouched.
+  - **Scoped to the file asked for.** Reading `logs/auth.json` reports
+    `auth`'s errors, never a louder neighbour's, and the suggested
+    follow-up carries the matching `--source`.
+  - **Small files are just read.** Below 4 KiB the raw file costs less
+    context than a summary of it and says more, so it passes through. A
+    `tail -f` is intercepted at any size — it never returns on its own.
+  - **Search patterns aren't paths.** `grep -rn 'logs/app.log' src/`
+    searches source code and is left alone.
+  - **Never a trap.** Repeating a denied read always runs it; the last 16
+    denials are tracked, so alternating phrasings can't corner the agent.
+  - **Never noise.** Malformed payloads, a missing index, a held lock, a
+    query over budget — every one exits 0 in silence and the command runs.
+    No first-ever ingest is ever triggered from inside a hook.
+
+  Overhead on a Bash call that reads no log: ~5 ms.
+
+### Changed
+
+- The plugin's `PreToolUse` matcher is now `Bash|Read`; `PostToolUseFailure`
+  remains Bash-only.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added

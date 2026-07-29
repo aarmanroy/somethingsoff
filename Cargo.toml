@@ -1,6 +1,6 @@
 [package]
 name = "somethingsoff"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "When something's off, ask your logs — local-first log search for developers and AI coding agents"
 authors = ["Aarman Roy <mail@aarmanroy.com>"]
@@ -23,6 +23,8 @@ exclude = [
     "SPEC-fast-time-filters-and-errors.md",
     "docs/RELEASE_PLAN.md",
     "*.html",
+    # Marketing artwork — 900 KB of source art nobody installing the crate needs.
+    "github-share-card/",
 ]
 
 [dependencies]

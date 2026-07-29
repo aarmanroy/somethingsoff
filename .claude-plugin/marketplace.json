@@ -11,7 +11,7 @@
     {
       "name": "somethingsoff",
       "source": "./claude-plugin",
-      "description": "Skill + failure hook: Claude searches your indexed logs the moment a command fails"
+      "description": "Skill + hooks: Claude searches your indexed logs the moment a command fails, and gets the indexed answer instead of the raw file when it reaches for a log"
     }
   ]
 }
