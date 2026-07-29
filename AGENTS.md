@@ -78,10 +78,13 @@ src/
                      cmd::prepare_read() (sync + searcher); all output via
                      output::Envelope. tap.rs journals stdin then indexes
                      inline when the lock is free. claude.rs installs the
-                     embedded SKILL.md; claude_hook.rs is the plugin's
-                     PostToolUseFailure hook (stdin: event JSON, stdout:
-                     additionalContext or nothing, always exit 0 —
-                     envelope-exempt, see CONTRACT.md).
+                     embedded SKILL.md; claude_hook.rs serves the plugin's
+                     two hook events (stdin: event JSON, stdout: one hook
+                     response or nothing, always exit 0 — envelope-exempt,
+                     see CONTRACT.md): PostToolUseFailure on Bash injects
+                     additionalContext, PreToolUse on Bash/Read denies a
+                     hand-read of an indexed log and returns the already-
+                     run query as the reason.
 claude-plugin/       the Claude Code plugin: .claude-plugin/plugin.json,
                      hooks/hooks.json, skills/somethingsoff/SKILL.md (the
                      single source of the skill — claude.rs include_str!s

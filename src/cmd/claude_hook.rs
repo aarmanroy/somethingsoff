@@ -1,16 +1,18 @@
 //! Claude Code hook entrypoint: `somethingsoff claude hook`.
 //!
 //! The bundled plugin (`claude-plugin/hooks/hooks.json`) runs this on two
-//! Bash tool events. Stdin is Claude Code's hook event JSON; stdout is an
+//! tool events. Stdin is Claude Code's hook event JSON; stdout is an
 //! optional hook response.
 //!
-//! - `PostToolUseFailure` — after a command fails, `additionalContext`
-//!   points Claude at the log evidence, ideally the actual top error group
-//!   from the freshly synced index.
-//! - `PreToolUse` — before a command that hand-reads an indexed log file
-//!   (`cat logs/app.log`), `permissionDecision: deny` returns the indexed
-//!   answer as the reason. The query has already run, so Claude gets the
-//!   answer instead of a suggestion to go find it.
+//! - `PostToolUseFailure` (Bash) — after a command fails,
+//!   `additionalContext` points Claude at the log evidence, ideally the
+//!   actual top error group from the freshly synced index.
+//! - `PreToolUse` (Bash or Read) — before a call that hand-reads an
+//!   indexed log file (`cat logs/app.log`, or `Read` on the same path),
+//!   `permissionDecision: deny` returns the indexed answer as the reason.
+//!   The query has already run, so Claude gets the answer instead of a
+//!   suggestion to go find it — and the answer is scoped to the source
+//!   being read, so a loud neighbour can't speak for a quiet file.
 //!
 //! This command is exempt from the v1 output envelope (see
 //! docs/CONTRACT.md): its stdout belongs to Claude Code's hook protocol.
@@ -58,9 +60,17 @@ const MAX_TEMPLATE_CHARS: usize = 160;
 const FILE_READERS: [&str; 11] = [
     "cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag",
 ];
-/// Extensions that mean "log file" outside `./logs/`. `.json` is
-/// deliberately absent — `package.json` is not a log.
-const LOG_FILE_EXTENSIONS: [&str; 2] = [".log", ".jsonl"];
+/// Readers whose first non-flag argument is a search pattern, not a path.
+const PATTERN_FIRST_READERS: [&str; 5] = ["grep", "egrep", "fgrep", "rg", "ag"];
+/// How many recent denials to remember. A single slot let an agent that
+/// alternates phrasings (`cat X`, then `tail X`, then `cat X` again)
+/// clobber its own escape hatch and be denied forever.
+const PRE_DENY_MEMORY: usize = 16;
+/// Below this many bytes, reading the file raw is simply the better
+/// answer: the whole file costs less context than the summary of it and
+/// tells Claude strictly more. Blocking here would spend tokens to lose
+/// information — the exact opposite of the point.
+const MIN_RAW_BYTES: u64 = 4096;
 
 /// The subset of Claude Code's hook event payload the hook cares about.
 /// Every field is optional-with-default: an unexpected shape must degrade
@@ -82,7 +92,10 @@ struct HookPayload {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ToolInput {
+    /// `Bash`.
     command: String,
+    /// `Read` — Claude's own file reader, which needs no shell parsing.
+    file_path: String,
 }
 
 /// Rate-limit state, kept in the OS temp dir (keyed by project cwd) so the
@@ -92,10 +105,16 @@ struct ToolInput {
 struct HookState {
     last_fired_unix: u64,
     last_fingerprint: String,
-    /// `PreToolUse` denials are tracked separately so the two events
-    /// sharing this file can never suppress each other.
-    last_pre_denied_unix: u64,
-    last_pre_fingerprint: String,
+    /// `PreToolUse` denials, newest last, tracked separately so the two
+    /// events sharing this file can never suppress each other.
+    recent_pre_denies: Vec<PreDeny>,
+}
+
+#[derive(Deserialize, Serialize, Default, Clone)]
+#[serde(default)]
+struct PreDeny {
+    fingerprint: String,
+    at_unix: u64,
 }
 
 /// Entry point. Infallible by design: always exits 0, prints either one
@@ -106,9 +125,6 @@ pub async fn run() -> u8 {
     let Some(payload) = read_payload() else {
         return 0;
     };
-    if payload.tool_name != "Bash" {
-        return 0;
-    }
     // Never act on our own invocations (including the skill's recipes).
     if payload.tool_input.command.contains(env!("CARGO_PKG_NAME")) {
         return 0;
@@ -118,8 +134,12 @@ pub async fn run() -> u8 {
         return 0;
     }
 
+    // `PreToolUse` also covers `Read`; the failure hook is Bash-only.
     if payload.hook_event_name == "PreToolUse" {
         return run_pre_tool_use(&payload).await;
+    }
+    if payload.tool_name != "Bash" {
+        return 0;
     }
     run_post_failure(&payload).await
 }
@@ -142,14 +162,31 @@ async fn run_post_failure(payload: &HookPayload) -> u8 {
     0
 }
 
-/// Before a command that hand-reads an indexed log: answer from the index
+/// Before a call that hand-reads an indexed log: answer from the index
 /// instead of letting the raw file into the context window.
 ///
-/// The rule is deliberately narrow — a reader command (`cat`, `tail`,
-/// `grep`, …) pointed at a path this project already indexes. Everything
-/// else runs untouched, and a deny is only emitted when the index has
-/// something better to say than the file does.
+/// The rule is deliberately narrow — a reader (`cat`, `tail`, `grep`, … or
+/// Claude's own `Read`) pointed at a path this project *actually* indexes.
+/// Everything else runs untouched, and a deny is only emitted when the
+/// index has something better to say than the file does.
 async fn run_pre_tool_use(payload: &HookPayload) -> u8 {
+    // Cheapest first: this runs before *every* Bash call Claude makes, so
+    // the common "not a log read at all" case must cost no filesystem I/O.
+    let (candidates, dedup_key) = match payload.tool_name.as_str() {
+        "Bash" => (
+            reader_path_tokens(&payload.tool_input.command),
+            payload.tool_input.command.as_str(),
+        ),
+        "Read" => (
+            vec![payload.tool_input.file_path.as_str()],
+            payload.tool_input.file_path.as_str(),
+        ),
+        _ => return 0,
+    };
+    if dedup_key.is_empty() || candidates.is_empty() {
+        return 0;
+    }
+
     let Ok(config) = Config::load() else {
         return 0;
     };
@@ -158,16 +195,27 @@ async fn run_pre_tool_use(payload: &HookPayload) -> u8 {
     if !config.index_dir().exists() {
         return 0;
     }
-    let Some(path) = reads_indexed_logs(&payload.tool_input.command, &config) else {
+    let sources = indexed_sources(&config);
+    let Some(target) = candidates
+        .iter()
+        .find_map(|candidate| resolve_target(candidate, &sources))
+    else {
         return 0;
     };
-    let Some(reason) = deny_reason(&path).await else {
+    // Only block a read the answer can actually beat. A small file is
+    // cheaper to read whole than to summarise — the exception being a
+    // follow, which never ends no matter how small the file is today.
+    let follows = payload.tool_name == "Bash" && follows_a_file(&payload.tool_input.command);
+    if !follows && indexed_bytes(&target.paths) < MIN_RAW_BYTES {
+        return 0;
+    }
+    let Some(reason) = deny_reason(&target).await else {
         return 0;
     };
-    // An immediate repeat of the same command is always allowed through:
-    // having seen the indexed answer, Claude may still want the raw bytes,
-    // and a hook must never trap the agent in a deny loop.
-    if pre_deny_suppressed(&payload.cwd, &payload.tool_input.command) {
+    // A repeat of the same read is always allowed through: having seen the
+    // indexed answer, Claude may still want the raw bytes, and a hook must
+    // never trap the agent in a deny loop.
+    if pre_deny_suppressed(&payload.cwd, dedup_key) {
         return 0;
     }
     emit(
@@ -267,7 +315,7 @@ async fn build_context(exit_code: Option<i32>) -> Option<(String, String)> {
     let has_logs = logs_dir_has_files();
 
     if has_index {
-        let query = tokio::task::spawn_blocking(|| query_recent_errors(LOOKBACK));
+        let query = tokio::task::spawn_blocking(|| query_recent_errors(LOOKBACK, None));
         match tokio::time::timeout(QUERY_BUDGET, query).await {
             Ok(Ok(Some((total, group)))) => {
                 return Some(live_context(exit_code, total, &group));
@@ -292,15 +340,43 @@ fn logs_dir_has_files() -> bool {
         .unwrap_or(false)
 }
 
-/// Does this command hand-read a file this project indexes? Returns the
-/// matched path, for naming in the deny reason.
+/// A read this hook can answer for: the path as the agent wrote it, plus
+/// the indexed source it maps to.
+struct IndexedTarget {
+    /// Echoed back in the deny reason, so Claude sees its own path.
+    display: String,
+    /// The one source being read. `None` for a directory-shaped read
+    /// (`grep -r boom logs/`), where the whole-index answer is correct.
+    source: Option<String>,
+    /// Canonical paths this read covers, for weighing the raw bytes it
+    /// would pull against the cost of the answer.
+    paths: Vec<String>,
+}
+
+/// The `(source name, canonical path)` pairs this project actually
+/// indexes, from the same discovery the sync engine uses.
 ///
-/// Word splitting is intentionally naive. The goal is to recognise the
-/// handful of shapes an agent actually types — `cat logs/app.log`,
-/// `tail -n 200 logs/app.log`, `grep -r boom logs/` — not to parse bash.
-/// Anything unrecognised falls through and runs, which is the safe way to
-/// be wrong.
-fn reads_indexed_logs(command: &str, config: &Config) -> Option<String> {
+/// Asking discovery — rather than pattern-matching the string — is what
+/// keeps the hook from claiming `/var/log/system.log` or `npm-debug.log`
+/// is ours and answering with unrelated project errors.
+fn indexed_sources(config: &Config) -> Vec<(String, String)> {
+    let state = crate::sync::state::SyncState::load(&crate::config::base_dir());
+    crate::sync::discover::discover_sources(config, &state)
+        .into_iter()
+        .map(|(name, path)| (name, crate::sync::state::canonical_key(&path)))
+        .collect()
+}
+
+/// The path-shaped arguments given to reader programs in this command
+/// line, in the order they appear.
+///
+/// Purely lexical, so a command that names no reader costs nothing. Word
+/// splitting is intentionally naive: the goal is to recognise the handful
+/// of shapes an agent actually types — `cat logs/app.log`, `tail -n 200
+/// logs/app.log`, `grep -r boom logs/` — not to parse bash. Anything
+/// unrecognised falls through and runs, which is the safe way to be wrong.
+fn reader_path_tokens(command: &str) -> Vec<&str> {
+    let mut tokens_out = Vec::new();
     for segment in split_segments(command) {
         let mut tokens = segment.split_whitespace();
         let Some(program) = tokens.next() else {
@@ -311,17 +387,22 @@ fn reads_indexed_logs(command: &str, config: &Config) -> Option<String> {
         if !FILE_READERS.contains(&program) {
             continue;
         }
+        // For `grep`-likes the first non-flag word is the pattern, not a
+        // path. Without this, `grep -rn 'logs/app.log' src/` — a search
+        // through *source code* for that string — gets denied.
+        let mut pattern_pending = PATTERN_FIRST_READERS.contains(&program);
         for token in tokens {
             if token.starts_with('-') {
                 continue;
             }
-            let candidate = token.trim_matches(['"', '\'']);
-            if is_indexed_path(candidate, config) {
-                return Some(candidate.to_string());
+            if pattern_pending {
+                pattern_pending = false;
+                continue;
             }
+            tokens_out.push(token);
         }
     }
-    None
+    tokens_out
 }
 
 /// Split on the shell operators that separate commands, so a reader
@@ -333,51 +414,133 @@ fn split_segments(command: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Is this path one the index already covers? Three ways to qualify: the
-/// zero-config `./logs/` convention, a log extension anywhere, or an
-/// explicitly configured source.
-fn is_indexed_path(candidate: &str, config: &Config) -> bool {
+/// Map one path token onto the index. Three outcomes: an exact indexed
+/// file, a directory holding indexed files, or `None` — not ours, so let
+/// the read run untouched.
+fn resolve_target(candidate: &str, sources: &[(String, String)]) -> Option<IndexedTarget> {
+    let candidate = candidate.trim_matches(['"', '\'']);
     if candidate.is_empty() {
-        return false;
+        return None;
     }
-    let path = candidate.trim_start_matches("./");
+    let mut normalized = candidate;
+    while let Some(rest) = normalized.strip_prefix("./") {
+        normalized = rest;
+    }
+    let key = crate::sync::state::canonical_key(Path::new(normalized));
 
-    let logs_dir = crate::sync::discover::LOGS_DIR;
-    if path == logs_dir
-        || path.starts_with(&format!("{}/", logs_dir))
-        || path.contains(&format!("/{}/", logs_dir))
-    {
-        return true;
+    if let Some((name, path)) = sources.iter().find(|(_, path)| *path == key) {
+        return Some(IndexedTarget {
+            display: candidate.to_string(),
+            source: Some(name.clone()),
+            paths: vec![path.clone()],
+        });
     }
-    if LOG_FILE_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
-        return true;
-    }
-    config.log_sources.values().any(|source| {
-        let source = source.trim_start_matches("./");
-        !source.is_empty() && path.starts_with(source)
+
+    // A directory of indexed files, or a glob inside one. Deliberately
+    // matched against each source's *immediate* parent: `grep -r boom
+    // logs/` is ours, `grep -r boom .` is an ordinary code search.
+    let dir = if normalized.contains('*') || normalized.contains('?') {
+        let parent = Path::new(normalized).parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        crate::sync::state::canonical_key(parent)
+    } else {
+        key
+    };
+    let dir = dir.trim_end_matches('/');
+    let held: Vec<String> = sources
+        .iter()
+        .filter(|(_, path)| {
+            Path::new(path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .is_some_and(|p| p == dir)
+        })
+        .map(|(_, path)| path.clone())
+        .collect();
+    (!held.is_empty()).then(|| IndexedTarget {
+        display: candidate.to_string(),
+        source: None,
+        paths: held,
+    })
+}
+
+/// Total bytes the read would pull in. Missing files count as zero, which
+/// biases toward letting the command run — the safe way to be wrong.
+fn indexed_bytes(paths: &[String]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Does this command *follow* a file (`tail -f`)? Worth intercepting at
+/// any size, because it never returns on its own — watching a log by hand
+/// is what `watch`/`tap` exist for.
+fn follows_a_file(command: &str) -> bool {
+    split_segments(command).iter().any(|segment| {
+        let mut tokens = segment.split_whitespace();
+        let Some(program) = tokens.next() else {
+            return false;
+        };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        if !matches!(program, "tail" | "less" | "more") {
+            return false;
+        }
+        tokens.any(|token| {
+            token == "--follow"
+                || token == "--retry"
+                || (token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token.chars().any(|c| c.eq_ignore_ascii_case(&'f')))
+        })
     })
 }
 
 /// The indexed answer, or `None` when there isn't one worth blocking for
 /// (nothing in the window, or the query blew its budget).
-async fn deny_reason(path: &str) -> Option<String> {
-    let query = tokio::task::spawn_blocking(|| query_recent_errors(PRE_LOOKBACK));
+///
+/// The query is scoped to the source being read. Answering a `cat
+/// logs/auth.json` with the whole index's top group is worse than
+/// silence: it buries the file's own errors under a louder neighbour's.
+async fn deny_reason(target: &IndexedTarget) -> Option<String> {
+    let source = target.source.clone();
+    let query =
+        tokio::task::spawn_blocking(move || query_recent_errors(PRE_LOOKBACK, source.as_deref()));
     let (total, top) = match tokio::time::timeout(QUERY_BUDGET, query).await {
         Ok(Ok(Some(found))) => found,
         _ => return None,
     };
 
     let name = env!("CARGO_PKG_NAME");
+    let scope = match &target.source {
+        Some(_) => "from this file",
+        None => "from these logs",
+    };
+    // Point the follow-up at the same slice the summary describes.
+    let raw_lines = match &target.source {
+        Some(source) => format!(
+            "{} --quiet search --last {} --source {} -n 50 --compact",
+            name, PRE_LOOKBACK, source
+        ),
+        None => format!(
+            "{} --quiet search --last {} -n 50 --compact",
+            name, PRE_LOOKBACK
+        ),
+    };
     let reason = format!(
         "`{}` is indexed by {}; reading it raw floods the context window. \
-         Already queried for you — last {}: {} error entr{}, \
+         Already queried for you — last {} {}: {} error entr{}, \
          top group \"{}\" ({}×, last seen {}). \
          Full breakdown: `{} --quiet errors --last {}`. \
-         Bounded raw lines: `{} --quiet search --last {} -n 50 --compact`. \
+         Bounded raw lines: `{}`. \
          Re-run this exact command to read the file anyway.",
-        path,
+        target.display,
         name,
         PRE_LOOKBACK,
+        scope,
         total,
         if total == 1 { "y" } else { "ies" },
         truncate_chars(&top.template, MAX_TEMPLATE_CHARS),
@@ -385,8 +548,7 @@ async fn deny_reason(path: &str) -> Option<String> {
         top.last_seen,
         name,
         PRE_LOOKBACK,
-        name,
-        PRE_LOOKBACK,
+        raw_lines,
     );
     Some(truncate_chars(&reason, MAX_REASON_CHARS))
 }
@@ -402,12 +564,13 @@ struct TopGroup {
 ///
 /// Deliberately NOT `ErrorsCommand::execute()` — that prints the v1
 /// envelope to stdout, which would corrupt the hook response.
-fn query_recent_errors(lookback: &str) -> Option<(usize, TopGroup)> {
+fn query_recent_errors(lookback: &str, source: Option<&str>) -> Option<(usize, TopGroup)> {
     let config = Config::load().ok()?;
     let (searcher, _report) = crate::cmd::prepare_read(config).ok()?;
     let options = SearchOptions {
         level: Some("error".to_string()),
         last: Some(lookback.to_string()),
+        source: source.map(str::to_string),
         ..Default::default()
     };
     let result = searcher.errors_query(&options, TOP_GROUPS).ok()?;
@@ -496,21 +659,39 @@ fn rate_limited(cwd: &str, fingerprint: &str) -> bool {
     false
 }
 
-/// A given command is denied at most once per `RATE_LIMIT`; the retry
-/// runs. Records the deny as a side effect when not suppressed.
-fn pre_deny_suppressed(cwd: &str, command: &str) -> bool {
+/// A given read is denied at most once per `RATE_LIMIT`; the retry runs.
+/// Records the deny as a side effect when not suppressed.
+///
+/// The last `PRE_DENY_MEMORY` denials are remembered, not just the most
+/// recent. With one slot, an agent that tried `cat X`, then `tail X`, then
+/// `cat X` again found its own escape hatch overwritten — and two
+/// alternating phrasings were denied forever.
+fn pre_deny_suppressed(cwd: &str, read: &str) -> bool {
     let path = state_path(cwd);
     let mut state = load_state(&path);
     let now = now_unix();
-    let fingerprint = hex::encode(&sha2::Sha256::digest(command.as_bytes())[..8]);
+    let fingerprint = hex::encode(&sha2::Sha256::digest(read.as_bytes())[..8]);
 
-    let within_window = now.saturating_sub(state.last_pre_denied_unix) < RATE_LIMIT.as_secs();
-    if within_window && state.last_pre_fingerprint == fingerprint {
+    state
+        .recent_pre_denies
+        .retain(|d| now.saturating_sub(d.at_unix) < RATE_LIMIT.as_secs());
+    if state
+        .recent_pre_denies
+        .iter()
+        .any(|d| d.fingerprint == fingerprint)
+    {
         return true;
     }
 
-    state.last_pre_denied_unix = now;
-    state.last_pre_fingerprint = fingerprint;
+    state.recent_pre_denies.push(PreDeny {
+        fingerprint,
+        at_unix: now,
+    });
+    let overflow = state
+        .recent_pre_denies
+        .len()
+        .saturating_sub(PRE_DENY_MEMORY);
+    state.recent_pre_denies.drain(..overflow);
     save_state(&path, &state);
     false
 }
@@ -559,6 +740,7 @@ mod tests {
             cwd: "/tmp".to_string(),
             tool_input: ToolInput {
                 command: command.to_string(),
+                ..Default::default()
             },
             error: Some(error.to_string()),
             ..Default::default()
@@ -621,32 +803,70 @@ mod tests {
         assert_eq!(detect_failure(&payload), None);
     }
 
+    /// Sources as `indexed_sources` produces them: canonical paths, so
+    /// both sides of the comparison go through the same normalisation.
+    fn fake_sources(paths: &[(&str, &str)]) -> Vec<(String, String)> {
+        paths
+            .iter()
+            .map(|(name, path)| {
+                (
+                    name.to_string(),
+                    crate::sync::state::canonical_key(Path::new(path)),
+                )
+            })
+            .collect()
+    }
+
+    fn app_log() -> Vec<(String, String)> {
+        fake_sources(&[("app", "logs/app.log")])
+    }
+
+    /// The two production steps a `PreToolUse` Bash event runs — extract
+    /// path tokens, then ground them in the real sources — as one call.
+    fn reads_indexed_logs(command: &str, sources: &[(String, String)]) -> Option<IndexedTarget> {
+        reader_path_tokens(command)
+            .into_iter()
+            .find_map(|token| resolve_target(token, sources))
+    }
+
     #[test]
     fn test_detects_hand_reading_of_indexed_logs() {
-        let config = Config::default();
+        let sources = app_log();
         for command in [
             "cat logs/app.log",
             "cat ./logs/app.log",
             "tail -n 200 logs/app.log",
             "tail -f logs/app.log",
-            "head -20 logs/app.jsonl",
             "grep -r boom logs/",
             "less logs/app.log",
             "/bin/cat logs/app.log",
             "rg timeout logs/app.log",
             "cat \"logs/app.log\"",
-            "cat .somethingsoff/streams/web.jsonl",
         ] {
             assert!(
-                reads_indexed_logs(command, &config).is_some(),
+                reads_indexed_logs(command, &sources).is_some(),
                 "should intercept: {command}"
             );
         }
     }
 
     #[test]
+    fn test_intercepted_read_names_its_source() {
+        let target = reads_indexed_logs("tail -f logs/app.log", &app_log()).unwrap();
+        assert_eq!(target.display, "logs/app.log");
+        // Scoping the query to this source is what keeps the answer honest.
+        assert_eq!(target.source.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn test_directory_read_answers_across_the_index() {
+        let target = reads_indexed_logs("grep -r boom logs/", &app_log()).unwrap();
+        assert_eq!(target.source, None);
+    }
+
+    #[test]
     fn test_ordinary_commands_run_untouched() {
-        let config = Config::default();
+        let sources = app_log();
         for command in [
             "cat README.md",
             "cat package.json", // a .json file is not a log
@@ -655,33 +875,87 @@ mod tests {
             "head -5 Cargo.toml",
             "npm test",
             "echo hi > logs/app.log", // writing, not reading
+            "grep -r boom .",         // an ordinary code search, not ours
         ] {
-            assert_eq!(
-                reads_indexed_logs(command, &config),
-                None,
+            assert!(
+                reads_indexed_logs(command, &sources).is_none(),
                 "should run untouched: {command}"
             );
         }
     }
 
+    /// Regression: a lexical `.log`/`.jsonl` rule denied any path that
+    /// merely looked like a log, then answered with *this* project's
+    /// errors — confidently wrong about a file it had never indexed.
+    #[test]
+    fn test_log_shaped_paths_we_do_not_index_run_untouched() {
+        let sources = app_log();
+        for command in [
+            "cat /var/log/system.log",
+            "cat npm-debug.log",
+            "tail -100 /tmp/build.log",
+            "cat node_modules/.cache/x.log",
+            "cat logs/app.log.1", // rotated-out, no longer a source
+        ] {
+            assert!(
+                reads_indexed_logs(command, &sources).is_none(),
+                "not indexed, must run untouched: {command}"
+            );
+        }
+    }
+
+    /// Regression: for `grep`-likes the first non-flag word is the
+    /// pattern. Searching source code *for* a log path is not a log read.
+    #[test]
+    fn test_a_log_path_used_as_a_search_pattern_is_not_a_read() {
+        let sources = app_log();
+        assert!(reads_indexed_logs("grep -rn 'logs/app.log' src/", &sources).is_none());
+        assert!(reads_indexed_logs("rg logs/app.log --files-with-matches", &sources).is_none());
+        // …but the same reader pointed at the file still fires.
+        assert!(reads_indexed_logs("grep ERROR logs/app.log", &sources).is_some());
+    }
+
     #[test]
     fn test_reader_behind_a_pipe_or_conjunction_is_seen() {
-        let config = Config::default();
-        assert!(reads_indexed_logs("npm test && cat logs/app.log", &config).is_some());
-        assert!(reads_indexed_logs("ls -la | grep x; tail logs/app.log", &config).is_some());
+        let sources = app_log();
+        assert!(reads_indexed_logs("npm test && cat logs/app.log", &sources).is_some());
+        assert!(reads_indexed_logs("ls -la | grep x; tail logs/app.log", &sources).is_some());
     }
 
     #[test]
     fn test_configured_source_outside_logs_dir_counts() {
-        let mut config = Config::default();
-        config
-            .log_sources
-            .insert("api".to_string(), "var/output.txt".to_string());
-        assert_eq!(
-            reads_indexed_logs("cat var/output.txt", &config).as_deref(),
-            Some("var/output.txt")
-        );
-        assert_eq!(reads_indexed_logs("cat var/other.txt", &config), None);
+        let sources = fake_sources(&[("api", "var/output.txt")]);
+        let target = reads_indexed_logs("cat var/output.txt", &sources).unwrap();
+        assert_eq!(target.display, "var/output.txt");
+        assert_eq!(target.source.as_deref(), Some("api"));
+        assert!(reads_indexed_logs("cat var/other.txt", &sources).is_none());
+    }
+
+    #[test]
+    fn test_follow_mode_is_recognised() {
+        for command in [
+            "tail -f logs/app.log",
+            "tail -F logs/app.log",
+            "tail --follow logs/app.log",
+            "tail -n 50 -f logs/app.log",
+        ] {
+            assert!(follows_a_file(command), "should be a follow: {command}");
+        }
+        for command in [
+            "tail -n 50 logs/app.log",
+            "cat logs/app.log",
+            "grep -f patterns.txt logs/app.log", // -f on grep is a file, not follow
+        ] {
+            assert!(!follows_a_file(command), "not a follow: {command}");
+        }
+    }
+
+    #[test]
+    fn test_read_tool_paths_resolve_the_same_way() {
+        let sources = app_log();
+        assert!(resolve_target("logs/app.log", &sources).is_some());
+        assert!(resolve_target("README.md", &sources).is_none());
+        assert!(resolve_target("", &sources).is_none());
     }
 
     #[test]

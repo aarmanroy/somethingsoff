@@ -1,9 +1,9 @@
 {
-  "description": "Answer log questions from the index: intercept hand-reading of an indexed log file (PreToolUse) and inject the project's log evidence when a Bash command fails (PostToolUseFailure)",
+  "description": "Answer log questions from the index: intercept hand-reading of an indexed log file (PreToolUse, Bash or Read) and inject the project's log evidence when a Bash command fails (PostToolUseFailure)",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Read",
         "hooks": [
           {
             "type": "command",
