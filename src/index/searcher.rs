@@ -188,11 +188,19 @@ impl IndexSearcher {
     }
 
     /// Fetch up to `limit` of the newest entries (for field profiling).
+    ///
+    /// Ordering everywhere in this file goes through the `timestamp_ms` u64
+    /// fast field, never the `timestamp` string field. `order_by_u64_field`
+    /// on a STRING field sorts by *segment-local term ordinal*, which happens
+    /// to look correct on the single-segment indexes tests build and returns
+    /// the wrong documents entirely on any index that has been synced more
+    /// than once. Every entry is guaranteed a `timestamp_ms` (schema v7), so
+    /// no document can be dropped for want of a sort value.
     pub fn sample_entries(&self, limit: usize) -> Result<Vec<LogEntry>> {
         let searcher = self.reader.searcher();
         let docs = searcher.search(
             &tantivy::query::AllQuery,
-            &TopDocs::with_limit(limit.max(1)).order_by_u64_field("timestamp", Order::Desc),
+            &TopDocs::with_limit(limit.max(1)).order_by_u64_field("timestamp_ms", Order::Desc),
         )?;
         Ok(docs
             .into_iter()
@@ -456,7 +464,7 @@ impl IndexSearcher {
         // entries are the relevant sample.
         let docs = searcher.search(
             &query,
-            &TopDocs::with_limit(scan_cap.max(1)).order_by_u64_field("timestamp", Order::Desc),
+            &TopDocs::with_limit(scan_cap.max(1)).order_by_u64_field("timestamp_ms", Order::Desc),
         )?;
 
         // Read only the four fields Drain needs — no LogEntry materialization.
@@ -556,7 +564,7 @@ impl IndexSearcher {
                     &query,
                     &TopDocs::with_limit(limit)
                         .and_offset(options.offset)
-                        .order_by_u64_field("timestamp", Order::Desc),
+                        .order_by_u64_field("timestamp_ms", Order::Desc),
                 )
                 .context("Search failed")?
                 .into_iter()
@@ -659,7 +667,8 @@ impl IndexSearcher {
         let mut entries: Vec<LogEntry> = searcher
             .search(
                 &range_query,
-                &TopDocs::with_limit(count + 1).order_by_u64_field("timestamp", direction.clone()),
+                &TopDocs::with_limit(count + 1)
+                    .order_by_u64_field("timestamp_ms", direction.clone()),
             )
             .context("Context window search failed")?
             .into_iter()

@@ -26,7 +26,16 @@ use tantivy::schema::*;
 /// v6: log_id for entries with no intrinsic timestamp is salted with the
 /// ingest position (file:byte-offset), so identical raw lines keep honest
 /// counts instead of collapsing, while re-reads still dedup by position.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// v7: every entry now carries a canonical timestamp, and therefore a
+/// `timestamp_ms`. A timestamp that can't be normalized (a time-only
+/// `01:57:10.385`, a log4j double-millis string) used to be stored verbatim,
+/// which left the entry with no `timestamp_ms` and thus invisible to every
+/// time filter; it now falls back to ingest time with the original kept in
+/// `attributes.original_timestamp`. This changes both display and `log_id`
+/// for those docs, and the always-present `timestamp_ms` is what lets search
+/// order by the numeric fast field instead of the string one.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Log entry as stored in the index and returned from searches.
 ///
@@ -534,20 +543,38 @@ pub fn normalize_source(source: &str) -> String {
 
 impl LogEntry {
     /// Create a LogEntry from a RawLogEntry with normalization and ID generation
-    pub fn from_raw(raw: RawLogEntry, default_source: &str) -> Self {
+    pub fn from_raw(mut raw: RawLogEntry, default_source: &str) -> Self {
         // Entries without an intrinsic timestamp get ingest wall-clock time;
         // their content alone can't distinguish repeats, so the log_id is
         // additionally salted with the stable ingest position (when known):
         // identical lines keep honest counts, re-reads still dedup.
-        let has_own_timestamp = raw.timestamp.is_some();
-        let timestamp = raw
-            .timestamp
-            .map(|ts| normalize_timestamp(&ts).unwrap_or(ts))
-            .unwrap_or_else(|| {
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string()
-            });
+        //
+        // A timestamp we cannot normalize counts as "without one". Keeping the
+        // raw string (the old behaviour) was strictly worse than having none:
+        // it produced no `timestamp_ms`, so the entry was unreachable by
+        // `--last`/`--start`/`--end` — a confident wrong answer rather than a
+        // visible gap — and it leaked a non-canonical shape into output. The
+        // original is preserved in `attributes` so no input is dropped.
+        let original = raw.timestamp.take();
+        let normalized = match original {
+            Some(ts) => match normalize_timestamp(&ts) {
+                Some(canonical) => Some(canonical),
+                None => {
+                    raw.extra.insert(
+                        "original_timestamp".to_string(),
+                        serde_json::Value::from(ts),
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let has_own_timestamp = normalized.is_some();
+        let timestamp = normalized.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        });
         let level = normalize_level(&raw.level.unwrap_or_else(|| "info".to_string()));
         let source = normalize_source(&raw.source.unwrap_or_else(|| default_source.to_string()));
         let message = raw.message.unwrap_or_default();

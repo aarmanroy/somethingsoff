@@ -3,6 +3,11 @@
 //! Parses Java Log4j and Log4j2 output:
 //! - Format: 2024-03-25 10:00:00,000 INFO  [thread] LoggerName - message
 //! - Also supports: 2024-03-25 10:00:00.000 INFO LoggerName - message
+//!
+//! The fractional second is optional and variable-precision: `%d{yyyy-MM-dd
+//! HH:mm:ss}` (no millis) is a common layout, and Java can emit micro- or
+//! nanosecond precision. Requiring exactly three digits silently dropped both
+//! shapes down to the raw fallback, which cost them their timestamp entirely.
 
 use crate::parser::{log_format::LogFormat, LogParser};
 use crate::schema::RawLogEntry;
@@ -16,7 +21,7 @@ pub struct Log4jParser;
 /// Pattern: 2024-03-25 10:00:00,000 INFO  [thread] LoggerName - message
 static LOG4J_PATTERN_WITH_THREAD: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(?P<level>\w+)\s+\[\s*(?P<thread>[\w\-]+)\s*\]\s+(?P<logger>[\w.]+)\s+-\s+(?P<message>.*)",
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?)\s+(?P<level>\w+)\s+\[\s*(?P<thread>[\w\-]+)\s*\]\s+(?P<logger>[\w.]+)\s+-\s+(?P<message>.*)",
     )
     .unwrap()
 });
@@ -25,7 +30,7 @@ static LOG4J_PATTERN_WITH_THREAD: Lazy<Regex> = Lazy::new(|| {
 /// Pattern: 2024-03-25 10:00:00,000 INFO LoggerName - message
 static LOG4J_PATTERN_SIMPLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(?P<level>\w+)\s+(?P<logger>[\w.]+)\s+-\s+(?P<message>.*)",
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?)\s+(?P<level>\w+)\s+(?P<logger>[\w.]+)\s+-\s+(?P<message>.*)",
     )
     .unwrap()
 });
@@ -34,7 +39,7 @@ static LOG4J_PATTERN_SIMPLE: Lazy<Regex> = Lazy::new(|| {
 /// Pattern: 2024-03-25 10:00:00,000 INFO - message
 static LOG4J_PATTERN_MINIMAL: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(?P<level>\w+)\s+-\s+(?P<message>.*)",
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?)\s+(?P<level>\w+)\s+-\s+(?P<message>.*)",
     )
     .unwrap()
 });
@@ -111,8 +116,18 @@ fn parse_log4j_timestamp(ts: &str) -> Option<String> {
     if parts.len() != 2 {
         return None;
     }
+    let (date, time) = (parts[0], parts[1]);
 
-    Some(format!("{}T{}.000Z", parts[0], parts[1]))
+    // Append millis only when the time doesn't already carry them. Appending
+    // unconditionally produced `10:00:01.500.000Z`, which `normalize_timestamp`
+    // rejects — so every log4j line written with the default layout (which does
+    // include millis) got no `timestamp_ms` and was invisible to `--last`,
+    // `--start` and `--end`. `python.rs` already guards this; log4j did not.
+    if time.contains('.') {
+        Some(format!("{date}T{time}Z"))
+    } else {
+        Some(format!("{date}T{time}.000Z"))
+    }
 }
 
 /// Normalize Log4j log level to lowercase

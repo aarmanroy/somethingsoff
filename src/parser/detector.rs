@@ -109,9 +109,13 @@ static GO_PATTERN: Lazy<Regex> = Lazy::new(|| {
 
 /// Log4j/Log4j2 pattern
 /// Pattern: 2024-03-25 10:00:00,000 INFO  [thread] LoggerName - message
+///
+/// The fractional second is optional, matching the parser: `%d{yyyy-MM-dd
+/// HH:mm:ss}` is a common layout. The level keyword immediately after the
+/// timestamp keeps this from claiming Python's `<ts> - <logger> - <LEVEL>`.
 static LOG4J_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,.]\d{3}\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)",
+        r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)",
     )
     .unwrap()
 });
