@@ -32,6 +32,22 @@ use sha2::Digest;
 use crate::config::Config;
 use crate::index::searcher::SearchOptions;
 
+/// Trace one decision to stderr when `SOMETHINGSOFF_HOOK_DEBUG` is set.
+///
+/// This hook exits 0 in silence on every path that has nothing useful to
+/// say, which is right in production and leaves it undiagnosable: "no
+/// errors in the window" and "broken since a payload change" look
+/// identical from outside. Claude Code surfaces hook stderr under
+/// `claude --debug`, so this is the supported way to ask it to explain
+/// itself. Off by default — stderr noise is still noise.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if std::env::var_os("SOMETHINGSOFF_HOOK_DEBUG").is_some() {
+            eprintln!("[somethingsoff hook] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Failing commands can embed sizable build output in the payload's
 /// `error` field; accept real-world payloads but stay bounded.
 const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024;
@@ -75,27 +91,80 @@ const MIN_RAW_BYTES: u64 = 4096;
 /// The subset of Claude Code's hook event payload the hook cares about.
 /// Every field is optional-with-default: an unexpected shape must degrade
 /// to silence, not to a parse error.
-#[derive(Deserialize, Default)]
-#[serde(default)]
+#[derive(Default)]
 struct HookPayload {
     hook_event_name: String,
     tool_name: String,
     cwd: String,
     tool_input: ToolInput,
-    /// `PostToolUseFailure` carries `"Exit code N\n<output>"` here.
+    /// The failure text, carrying `"Exit code N\n<output>"` when present.
     error: Option<String>,
     is_interrupt: bool,
     /// `PostToolUse` result object, probed for explicit failure signals.
     tool_response: serde_json::Value,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
+#[derive(Default)]
 struct ToolInput {
     /// `Bash`.
     command: String,
     /// `Read` — Claude's own file reader, which needs no shell parsing.
     file_path: String,
+}
+
+/// Keys the failure text has been observed under. Taking the first that
+/// holds a string means a rename on Claude Code's side costs the exit-code
+/// annotation, not the whole hook.
+const ERROR_KEYS: [&str; 3] = ["error", "error_message", "failure_reason"];
+
+impl HookPayload {
+    /// Build from the event JSON one field at a time.
+    ///
+    /// Deliberately not a derived `Deserialize`: that is all-or-nothing, so a
+    /// single field arriving with an unexpected type — a future release
+    /// sending `error` as an object rather than a string — would fail the
+    /// whole parse and disable the hook permanently, with no signal at all.
+    /// The struct's doc promises each field degrades on its own; only this
+    /// makes that true.
+    fn from_value(value: &serde_json::Value) -> Self {
+        HookPayload {
+            hook_event_name: string_at(value, "hook_event_name"),
+            tool_name: string_at(value, "tool_name"),
+            cwd: string_at(value, "cwd"),
+            tool_input: ToolInput {
+                command: nested_string(value, "tool_input", "command"),
+                file_path: nested_string(value, "tool_input", "file_path"),
+            },
+            error: ERROR_KEYS
+                .iter()
+                .find_map(|key| value.get(key).and_then(|v| v.as_str()))
+                .map(str::to_string),
+            is_interrupt: value
+                .get("is_interrupt")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            tool_response: value.get("tool_response").cloned().unwrap_or_default(),
+        }
+    }
+}
+
+/// A top-level string field, or empty when absent or the wrong type.
+fn string_at(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A string one level down, or empty when any step is absent or mistyped.
+fn nested_string(value: &serde_json::Value, outer: &str, inner: &str) -> String {
+    value
+        .get(outer)
+        .and_then(|v| v.get(inner))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Rate-limit state, kept in the OS temp dir (keyed by project cwd) so the
@@ -125,12 +194,20 @@ pub async fn run() -> u8 {
     let Some(payload) = read_payload() else {
         return 0;
     };
+    trace!(
+        "event={:?} tool={:?} cwd={:?}",
+        payload.hook_event_name,
+        payload.tool_name,
+        payload.cwd
+    );
     // Never act on our own invocations (including the skill's recipes).
     if payload.tool_input.command.contains(env!("CARGO_PKG_NAME")) {
+        trace!("bail: the command is one of ours");
         return 0;
     }
     // All project state (config, index, logs dir) is cwd-relative.
     if payload.cwd.is_empty() || std::env::set_current_dir(&payload.cwd).is_err() {
+        trace!("bail: cwd missing or unusable");
         return 0;
     }
 
@@ -139,6 +216,7 @@ pub async fn run() -> u8 {
         return run_pre_tool_use(&payload).await;
     }
     if payload.tool_name != "Bash" {
+        trace!("bail: the failure hook is Bash-only");
         return 0;
     }
     run_post_failure(&payload).await
@@ -147,14 +225,18 @@ pub async fn run() -> u8 {
 /// After a failed command: point Claude at the evidence.
 async fn run_post_failure(payload: &HookPayload) -> u8 {
     let Some(exit_code) = detect_failure(payload) else {
+        trace!("bail: not a recognised failure");
         return 0;
     };
     let Some((context, fingerprint)) = build_context(exit_code).await else {
+        trace!("bail: nothing worth injecting");
         return 0;
     };
     if rate_limited(&payload.cwd, &fingerprint) {
+        trace!("bail: rate-limited on fingerprint {fingerprint} (window {RATE_LIMIT:?})");
         return 0;
     }
+    trace!("injecting additionalContext");
     emit(
         &payload.hook_event_name,
         serde_json::json!({ "additionalContext": context }),
@@ -249,7 +331,10 @@ fn read_payload() -> Option<HookPayload> {
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut raw)
         .ok()?;
-    serde_json::from_str(&raw).ok()
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .inspect_err(|e| trace!("stdin was not valid JSON: {e}"))
+        .ok()?;
+    Some(HookPayload::from_value(&value))
 }
 
 /// Did this Bash tool call fail? Returns the exit code when known.
@@ -310,26 +395,36 @@ fn parse_exit_code(error: &str) -> Option<i32> {
 /// (no index yet but `./logs/` has files — never trigger a first-ever
 /// ingest from inside a hook), or `None` (nothing useful to say).
 async fn build_context(exit_code: Option<i32>) -> Option<(String, String)> {
-    let config = Config::load().ok()?;
+    let config = Config::load()
+        .inspect_err(|e| trace!("Config::load failed: {e}"))
+        .ok()?;
     let has_index = config.index_dir().exists();
     let has_logs = logs_dir_has_files();
+    trace!("has_index={has_index} has_logs={has_logs}");
 
     if has_index {
         let query = tokio::task::spawn_blocking(|| query_recent_errors(LOOKBACK, None));
         match tokio::time::timeout(QUERY_BUDGET, query).await {
             Ok(Ok(Some((total, group)))) => {
+                trace!("live context: {total} errors in {LOOKBACK}");
                 return Some(live_context(exit_code, total, &group));
             }
             // Query ran and found nothing in the window: the logs hold no
             // evidence, so stay silent rather than spend Claude's tokens.
-            Ok(Ok(None)) => return None,
+            Ok(Ok(None)) => {
+                trace!("no errors in the last {LOOKBACK}");
+                return None;
+            }
             // Timeout or query failure: degrade to the static pointer.
-            _ => {}
+            Ok(Err(e)) => trace!("query task failed: {e}"),
+            Err(_) => trace!("query exceeded its {QUERY_BUDGET:?} budget"),
         }
     }
     if has_index || has_logs {
+        trace!("static context");
         return Some(static_context(exit_code));
     }
+    trace!("no index and no ./logs — nothing to say");
     None
 }
 
@@ -800,6 +895,78 @@ mod tests {
         payload.tool_response = serde_json::json!({"exit_code": 2});
         assert_eq!(detect_failure(&payload), Some(Some(2)));
         payload.tool_response = serde_json::json!({"exit_code": 0});
+        assert_eq!(detect_failure(&payload), None);
+    }
+
+    /// A single mistyped field must not disable the hook.
+    ///
+    /// With a derived `Deserialize` this whole payload failed to parse, so
+    /// the hook went permanently silent with no signal — the worst outcome
+    /// for something whose normal behaviour is also silence. Each field has
+    /// to degrade on its own.
+    #[test]
+    fn test_one_mistyped_field_does_not_discard_the_payload() {
+        let value = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "cwd": "/tmp/x",
+            "tool_input": {"command": "npm test"},
+            "error": 123,                 // string everywhere else
+            "is_interrupt": "no",         // bool everywhere else
+            "tool_response": {"exit_code": 3},
+        });
+        let payload = HookPayload::from_value(&value);
+        // The mistyped fields fall back...
+        assert_eq!(payload.error, None);
+        assert!(!payload.is_interrupt);
+        // ...and everything else still arrives intact.
+        assert_eq!(payload.hook_event_name, "PostToolUseFailure");
+        assert_eq!(payload.tool_name, "Bash");
+        assert_eq!(payload.cwd, "/tmp/x");
+        assert_eq!(payload.tool_input.command, "npm test");
+        assert_eq!(detect_failure(&payload), Some(None));
+    }
+
+    /// `tool_input` arriving as a scalar must not panic or poison the parse.
+    #[test]
+    fn test_wrongly_shaped_tool_input_degrades_to_empty() {
+        let value = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": "/tmp/x",
+            "tool_input": "not an object",
+        });
+        let payload = HookPayload::from_value(&value);
+        assert_eq!(payload.tool_input.command, "");
+        assert_eq!(payload.tool_input.file_path, "");
+        assert_eq!(payload.hook_event_name, "PreToolUse");
+    }
+
+    /// The failure text has been seen under more than one key; accept any of
+    /// them so a rename costs the exit-code annotation, not the hook.
+    #[test]
+    fn test_failure_text_accepted_under_any_known_key() {
+        for key in ERROR_KEYS {
+            let value = serde_json::json!({
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                key: "Exit code 42\nboom",
+            });
+            let payload = HookPayload::from_value(&value);
+            assert_eq!(
+                detect_failure(&payload),
+                Some(Some(42)),
+                "exit code should be read from {key}"
+            );
+        }
+    }
+
+    /// Missing fields are absent, not defaults that look like real data.
+    #[test]
+    fn test_empty_payload_is_inert() {
+        let payload = HookPayload::from_value(&serde_json::json!({}));
+        assert_eq!(payload.hook_event_name, "");
+        assert_eq!(payload.tool_name, "");
         assert_eq!(detect_failure(&payload), None);
     }
 
