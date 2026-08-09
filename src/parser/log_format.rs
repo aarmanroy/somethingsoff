@@ -21,6 +21,8 @@ pub enum LogFormat {
     Log4j,
     /// Syslog (RFC3164 / RFC5424)
     Syslog,
+    /// Rails / ActiveSupport::TaggedLogging
+    Rails,
     /// Unknown/unsupported format
     Unknown,
 }
@@ -36,6 +38,7 @@ impl LogFormat {
             LogFormat::ApacheCombined => "apache-combined",
             LogFormat::Log4j => "log4j",
             LogFormat::Syslog => "syslog",
+            LogFormat::Rails => "rails",
             LogFormat::Unknown => "unknown",
         }
     }
@@ -50,6 +53,7 @@ impl LogFormat {
             "apache" | "nginx" | "apache-combined" => Some(LogFormat::ApacheCombined),
             "log4j" | "log4j2" => Some(LogFormat::Log4j),
             "syslog" => Some(LogFormat::Syslog),
+            "rails" => Some(LogFormat::Rails),
             _ => None,
         }
     }

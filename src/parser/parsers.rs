@@ -7,6 +7,7 @@ pub mod go_logrus;
 pub mod log4j;
 pub mod logfmt;
 pub mod python;
+pub mod rails;
 pub mod syslog;
 
 use crate::parser::detector::detect_format;
@@ -66,6 +67,7 @@ pub fn parse_log_entry(line: &str, source: &str) -> Option<RawLogEntry> {
         LogFormat::GoLogrus => go_logrus::GoLogrusParser.parse(line, source),
         LogFormat::Log4j => log4j::Log4jParser.parse(line, source),
         LogFormat::Syslog => syslog::SyslogParser.parse(line, source),
+        LogFormat::Rails => rails::RailsParser.parse(line, source),
         LogFormat::Unknown => None,
     };
 
@@ -161,7 +163,11 @@ pub fn strip_ansi(line: &str) -> String {
 
 /// Best-effort log level for an unstructured line. `None` → caller's default
 /// (`info`). Priority: error > warn > debug.
-fn sniff_level(text: &str) -> Option<String> {
+///
+/// Shared with the Rails parser: Rails puts no severity on the line, so a
+/// parser that extracts structure but skips this would classify every
+/// exception as `info` — strictly worse than the raw fallback it replaced.
+pub(crate) fn sniff_level(text: &str) -> Option<String> {
     if ERROR_RE.is_match(text) || text.contains('✗') || text.contains('×') || text.contains('✘')
     {
         Some("error".to_string())

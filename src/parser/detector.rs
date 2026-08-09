@@ -63,6 +63,14 @@ pub fn detect_format(sample_lines: &[&str]) -> LogFormat {
             return LogFormat::Log4j;
         }
 
+        // Rails: [<request id>] Started GET "/" for ... — the tag alone is
+        // too loose to match on, so detection requires one of the three
+        // lines Rails actually generates. Other tagged lines in the file are
+        // still parsed once the file is known to be Rails.
+        if RAILS_PATTERN.is_match(line) {
+            return LogFormat::Rails;
+        }
+
         // Syslog last: RFC3164's shape is loose, so specific formats win
         if SYSLOG_5424_PATTERN.is_match(line) || SYSLOG_3164_PATTERN.is_match(line) {
             return LogFormat::Syslog;
@@ -105,6 +113,26 @@ static PYTHON_NAME_FIRST_PATTERN: Lazy<Regex> = Lazy::new(|| {
 static GO_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+(DEBUG|INFO|WARN|ERROR|FATAL|PANIC)")
         .unwrap()
+});
+
+/// Rails / ActiveSupport::TaggedLogging.
+/// Pattern: [<request id>] Started|Processing by|Completed ...
+///
+/// Detection is per line, so this has to recognise every line of a request,
+/// not just the three Rails generates — otherwise the bulk of a Rails log
+/// (queries, warnings, `Cannot render console from ...`) falls through to raw
+/// and loses the request id that ties a request together.
+///
+/// Two ways to qualify. A UUID tag is claimed on sight: that is Rails' default
+/// request id and nothing else writes it in leading brackets. Any other tag
+/// must be followed by a line Rails itself emits, because `[anything] message`
+/// is far too common a shape to take on the tag alone.
+static RAILS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"^\[[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\]\s+\S",
+        r#"|^\[[A-Za-z0-9][A-Za-z0-9._:-]{7,}\]\s+(?:Started\s+[A-Z]+\s+"|Processing by\s+\S+|Completed\s+\d{3}\b)"#,
+    ))
+    .unwrap()
 });
 
 /// Log4j/Log4j2 pattern
