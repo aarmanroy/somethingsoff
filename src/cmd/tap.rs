@@ -61,13 +61,22 @@ impl TapCommand {
 
         // Journal setup (append mode; previous content is already tracked
         // in sync state or will be picked up by discovery).
+        let _ = crate::config::ensure_base_dir();
         let streams_dir = base_dir.join(STREAMS_DIR);
         std::fs::create_dir_all(&streams_dir)
             .with_context(|| format!("Failed to create streams dir: {:?}", streams_dir))?;
         let journal_path = streams_dir.join(format!("{}.jsonl", source));
-        let mut journal = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.create(true).append(true);
+        // The journal is the most sensitive file this tool writes: whole log
+        // lines, verbatim apart from redaction. Owner-only from the moment it
+        // is created, rather than inheriting a permissive umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        let mut journal = open_options
             .open(&journal_path)
             .with_context(|| format!("Failed to open journal: {:?}", journal_path))?;
         let mut journal_offset = journal.metadata().map(|m| m.len()).unwrap_or(0);
@@ -141,15 +150,21 @@ impl TapCommand {
             writeln!(stdout, "{}", line).ok();
             stdout.flush().ok();
 
-            // 2. Journal
+            // 2. Journal — redacted. Passthrough above stays verbatim (the
+            // user is watching their own dev server and expects its exact
+            // output), but the journal persists to disk and is replayed into
+            // the index, so it must not be the one place a secret survives.
+            // Offsets are computed from what is actually written, keeping the
+            // cursor and the ingest positions consistent with the file.
+            let journal_line = crate::pii::redact_line(&line);
             let line_start = journal_offset;
-            writeln!(journal, "{}", line).context("Failed to write journal")?;
-            journal_offset += line.len() as u64 + 1;
+            writeln!(journal, "{}", journal_line).context("Failed to write journal")?;
+            journal_offset += journal_line.len() as u64 + 1;
 
             // 3. Inline ingest (journal-only mode leaves indexing to sync,
             // which coalesces identically when replaying the journal)
             if let Some(ref mut idx) = indexer {
-                if let Some(block) = coalescer.push(&line, line_start) {
+                if let Some(block) = coalescer.push(&journal_line, line_start) {
                     index_tap_block(
                         &block,
                         &journal_path,

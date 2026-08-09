@@ -97,6 +97,27 @@ pub fn base_dir() -> PathBuf {
     PathBuf::from(".somethingsoff")
 }
 
+/// Create `base_dir()` and make it exclude itself from git.
+///
+/// Everything under this directory is derived from log content — the index,
+/// and the `tap` journals most of all — which is exactly the material most
+/// likely to carry a credential. Writing the `.gitignore` at creation time
+/// means the directory cannot be committed by accident without the user
+/// having to know it exists. Idempotent, and never overwrites a file the
+/// user has edited.
+pub fn ensure_base_dir() -> std::io::Result<PathBuf> {
+    let dir = base_dir();
+    std::fs::create_dir_all(&dir)?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(
+            &ignore,
+            "# Created by somethingsoff. Holds indexed log content; never commit it.\n*\n",
+        )?;
+    }
+    Ok(dir)
+}
+
 fn default_index_path() -> PathBuf {
     base_dir().join("index")
 }

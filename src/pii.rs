@@ -21,10 +21,14 @@ const EMAIL_PAT: &str = r"(?i)\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}
 /// Bearer / basic auth tokens: Bearer sk-abc123, Basic dXNlcjpwYXNz, token=abc123
 const AUTH_TOKEN_PAT: &str = r"(?i)(bearer|basic)\s+\S+|(token)\s*[=:]\s*\S+";
 /// Passwords in key-value or JSON form: password=secret, "password":"secret", pwd: abc
-const PASSWORD_PAT: &str = r#"(?i)(password|passwd|pwd|secret|pass)\s*[:=]\s*\S+"#;
+///
+/// The leading `\b` matters: without it the `pass` alternative matched inside
+/// ordinary words, so `compass=north` was stored as `compass [REDACTED]` —
+/// redaction quietly destroying real log content.
+const PASSWORD_PAT: &str = r#"(?i)\b(password|passwd|pwd|secret|pass)\s*[:=]\s*\S+"#;
 /// API keys: api_key=xxx, apikey xxx, secret_key=xxx, access-key xxx
 const API_KEY_PAT: &str =
-    r#"(?i)(api[_-]?key|apikey|secret[_-]?key|private[_-]?key|access[_-]?key)\s*[:= ]\s*\S+"#;
+    r#"(?i)\b(api[_-]?key|apikey|secret[_-]?key|private[_-]?key|access[_-]?key)\s*[:= ]\s*\S+"#;
 /// Credit card numbers: 4111-1111-1111-1111, 4111 1111 1111 1111, 4111111111111111
 const CREDIT_CARD_PAT: &str = r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b";
 /// US Social Security Numbers: 123-45-6789
@@ -33,7 +37,44 @@ const SSN_PAT: &str = r"\b\d{3}-\d{2}-\d{4}\b";
 const AWS_KEY_PAT: &str = r"AKIA[A-Z0-9]{16}";
 /// Generic hex tokens that look like secrets (32+ hex chars after key= pattern)
 const HEX_SECRET_PAT: &str =
-    r#"(?i)(key|token|secret|auth|credential|session)\s*[:=]\s*[a-f0-9]{32,}"#;
+    r#"(?i)\b(key|token|secret|auth|credential|session)\s*[:=]\s*[a-f0-9]{32,}"#;
+
+// --- Self-identifying credentials -----------------------------------------
+//
+// Every pattern above is keyword-anchored: it only fires next to `token=`,
+// `password:` and friends. That fails open on the entire generation of
+// credentials whose *prefix* is the identifier, which is how they appear in
+// real logs — bare, in a stack trace or a URL, with no keyword in sight.
+// These need no anchor, and a bare secret in an index an LLM reads is an
+// unbounded loss, so they are matched on shape alone.
+
+/// Vendor-prefixed API tokens. Each alternative carries its own issuer's
+/// prefix and a length floor, so the shape alone is the evidence.
+const VENDOR_TOKEN_PAT: &str = concat!(
+    r"\b(?:",
+    r"gh[pousr]_[A-Za-z0-9]{20,}",    // GitHub classic PAT / OAuth
+    r"|github_pat_[A-Za-z0-9_]{20,}", // GitHub fine-grained PAT
+    r"|glpat-[A-Za-z0-9_\-]{16,}",    // GitLab PAT
+    r"|sk-ant-[A-Za-z0-9_\-]{16,}",   // Anthropic
+    r"|sk-proj-[A-Za-z0-9_\-]{16,}",  // OpenAI project key
+    r"|[sr]k_(?:live|test)_[A-Za-z0-9]{8,}", // Stripe secret/restricted
+    r"|xox[abposr]-[A-Za-z0-9\-]{10,}", // Slack
+    r"|AIza[A-Za-z0-9_\-]{35,}",      // Google API key
+    r"|npm_[A-Za-z0-9]{30,}",         // npm automation token
+    r"|hf_[A-Za-z0-9]{30,}",          // Hugging Face
+    r"|dop_v1_[a-f0-9]{60,}",         // DigitalOcean
+    r"|shp(?:at|ss|pa|ca)_[a-fA-F0-9]{32}", // Shopify
+    r")",
+);
+/// JSON Web Tokens: three base64url segments, the first always starting `eyJ`
+/// (base64 of `{"`). Distinctive enough to match unanchored.
+const JWT_PAT: &str = r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+";
+/// PEM private key blocks. Matched non-greedily across lines so an inline
+/// key is removed whole rather than leaving its body behind.
+const PEM_KEY_PAT: &str =
+    r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----";
+/// Credentials embedded in a URL: postgres://user:hunter2@host/db
+const URL_CREDENTIAL_PAT: &str = r"([A-Za-z][A-Za-z0-9+.\-]*://)[^\s/:@]+:[^\s/@]+@";
 
 // ---------------------------------------------------------------------------
 // Compiled regex patterns (allocated once, reused across all invocations)
@@ -47,6 +88,10 @@ static CREDIT_CARD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(CREDIT_CARD_PAT).un
 static SSN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(SSN_PAT).unwrap());
 static AWS_KEY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(AWS_KEY_PAT).unwrap());
 static HEX_SECRET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(HEX_SECRET_PAT).unwrap());
+static VENDOR_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(VENDOR_TOKEN_PAT).unwrap());
+static JWT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(JWT_PAT).unwrap());
+static PEM_KEY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(PEM_KEY_PAT).unwrap());
+static URL_CREDENTIAL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(URL_CREDENTIAL_PAT).unwrap());
 
 /// One combined matcher over every PII pattern. `is_match` runs a single DFA
 /// pass with no allocation, so the overwhelmingly common "no PII on this line"
@@ -61,6 +106,10 @@ static PII_SET: Lazy<RegexSet> = Lazy::new(|| {
         SSN_PAT,
         AWS_KEY_PAT,
         HEX_SECRET_PAT,
+        VENDOR_TOKEN_PAT,
+        JWT_PAT,
+        PEM_KEY_PAT,
+        URL_CREDENTIAL_PAT,
     ])
     .unwrap()
 });
@@ -114,7 +163,30 @@ fn redact_string(input: &str) -> String {
         .replace_all(&result, "$1 [REDACTED]")
         .to_string();
 
-    // 8. Email addresses (last — emails can appear inside other patterns)
+    // 8. Self-identifying credentials, for whatever no keyword covered.
+    //
+    //    These run *after* the keyword patterns, not before. A keyword pattern
+    //    consumes `key=value` whole, so `api_key=sk_live_x` becomes
+    //    `api_key [REDACTED]` in one clean replacement. Running the vendor
+    //    pass first turned it into `api_key=[SECRET REDACTED]`, and the
+    //    keyword pattern's `\S+` then ate half the placeholder, leaving
+    //    `api_key [REDACTED] REDACTED]`. Anything bare — the common case, a
+    //    token in a stack trace or a URL — still gets caught here.
+    result = PEM_KEY_RE
+        .replace_all(&result, "[PRIVATE KEY REDACTED]")
+        .to_string();
+    result = JWT_RE.replace_all(&result, "[JWT REDACTED]").to_string();
+    result = VENDOR_TOKEN_RE
+        .replace_all(&result, "[SECRET REDACTED]")
+        .to_string();
+    //    Keep the scheme and host readable — the credential is the secret,
+    //    the endpoint is usually the thing being debugged. Must precede the
+    //    email pass, which would otherwise match `user:pass@host`.
+    result = URL_CREDENTIAL_RE
+        .replace_all(&result, "$1[CREDENTIALS REDACTED]@")
+        .to_string();
+
+    // 9. Email addresses (last — emails can appear inside other patterns)
     result = EMAIL_RE
         .replace_all(&result, "[EMAIL REDACTED]")
         .to_string();
@@ -130,6 +202,21 @@ fn redact_owned(s: String) -> String {
         redact_string(&s)
     } else {
         s
+    }
+}
+
+/// Redact a raw log line before it is written somewhere durable.
+///
+/// Redaction normally happens at the `RawLogEntry` level, after parsing — but
+/// the `tap` journal writes the verbatim line to disk *before* anything parses
+/// it, which made it the one place a secret could outlive redaction entirely.
+/// Borrows when there is nothing to redact, so the hot path stays allocation
+/// free. Honours `--no-redact` like every other redaction site.
+pub fn redact_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if crate::is_no_redact() || !PII_SET.is_match(line) {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        std::borrow::Cow::Owned(redact_string(line))
     }
 }
 
@@ -591,5 +678,104 @@ mod tests {
 
         // Reset
         crate::set_no_redact(false);
+    }
+
+    /// Fail-closed fixture. Every credential here is self-identifying: it
+    /// carries no `token=` keyword, which is exactly how secrets appear in
+    /// real logs and exactly what the keyword-anchored patterns missed. All
+    /// values are syntactically valid but fabricated.
+    ///
+    /// A leak here is unbounded harm — the index is read by an LLM — so this
+    /// asserts the secret is *absent*, not merely that something was replaced.
+    ///
+    /// Every fixture is assembled at runtime from split literals, so the file
+    /// itself contains no string a secret scanner will match. This is not
+    /// superstition: an earlier version of this test was rejected by GitHub
+    /// push protection over the GitLab token fixture. A good fixture for "we
+    /// must redact `glpat-`" is by construction indistinguishable from a real
+    /// one, which is the point of the fixture and also the problem with it.
+    #[test]
+    fn test_self_identifying_secrets_never_survive() {
+        // Joined at runtime; `prefix` never sits next to `body` in the source.
+        fn fake(prefix: &str, body: &str) -> String {
+            format!("{prefix}{body}")
+        }
+        let cases = [
+            fake("ghp", "_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII"),
+            fake("github", "_pat_11ABCDEFG0aaaaaaaaaaaaaa_fakefakefakefake"),
+            fake("glpat", "-FAKEfakeFAKEfake1234"),
+            fake("sk-ant", "-api03-ZZZZfakefakefakefake-not-real"),
+            fake("sk-proj", "-FAKEfakeFAKEfakeFAKEfake"),
+            fake("sk", "_live_51ABCDEFfakefakefake"),
+            fake("rk", "_test_51ABCDEFfakefakefake"),
+            fake("xoxb", "-1111-2222-fakefakefakefake"),
+            fake("AIza", "SyFAKEfakeFAKEfakeFAKEfakeFAKEfake1"),
+            fake("npm", "_FAKEfakeFAKEfakeFAKEfakeFAKEfake12"),
+            fake("hf", "_FAKEfakeFAKEfakeFAKEfakeFAKEfake12"),
+            // Three base64url segments, each split from its `eyJ` marker.
+            format!(
+                "{}.{}.fakesigfakesig",
+                fake("eyJ", "hbGciOiJIUzI1NiJ9"),
+                fake("eyJ", "zdWIiOiIxMjM0NTY3In0")
+            ),
+        ];
+        for secret in &cases {
+            // Bare, with no surrounding keyword — the failing case.
+            let line = format!("request failed using {secret} at boot");
+            let redacted = redact_string(&line);
+            assert!(
+                !redacted.contains(secret.as_str()),
+                "secret survived redaction: {redacted}"
+            );
+        }
+    }
+
+    /// Assembled at runtime for the same reason as the fixtures above: a
+    /// literal PEM block in the source is what scanners are built to find.
+    #[test]
+    fn test_pem_private_key_block_is_removed_whole() {
+        let dashes = "-----";
+        let body = "MIIEowIBAAKCAQEAfake";
+        let line = format!(
+            "startup: {dashes}BEGIN RSA PRIVATE KEY{dashes}\n{body}\n{dashes}END RSA PRIVATE KEY{dashes} loaded"
+        );
+        let redacted = redact_string(&line);
+        assert!(!redacted.contains(body), "{redacted}");
+        assert!(!redacted.contains("BEGIN RSA PRIVATE KEY"), "{redacted}");
+        assert!(redacted.contains("loaded"), "{redacted}");
+    }
+
+    #[test]
+    fn test_url_credentials_redacted_but_endpoint_kept() {
+        let redacted = redact_string("connect postgres://admin:hunter2@db.internal:5432/app");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(!redacted.contains("admin:"), "{redacted}");
+        // The endpoint is usually the thing being debugged; keep it legible.
+        assert!(redacted.contains("db.internal:5432/app"), "{redacted}");
+        assert!(redacted.contains("postgres://"), "{redacted}");
+    }
+
+    /// Redaction that eats real content is its own failure mode: `pass` used
+    /// to match inside ordinary words, so `compass=north` became
+    /// `compass [REDACTED]`.
+    #[test]
+    fn test_ordinary_content_is_not_over_redacted() {
+        for line in [
+            "compass=north heading stable",
+            "bypass=true for this route",
+            "retry after 3000ms on /api/orders",
+            "class=UserService method=save",
+        ] {
+            assert_eq!(redact_string(line), line, "over-redacted: {line}");
+        }
+    }
+
+    /// A keyword-anchored match and a self-identifying one covering the same
+    /// text must not chop each other's placeholder.
+    #[test]
+    fn test_keyword_and_vendor_patterns_do_not_collide() {
+        let redacted = redact_string("api_key=sk_live_abc123def456");
+        assert_eq!(redacted, "api_key [REDACTED]");
+        assert!(!redacted.contains("sk_live"), "{redacted}");
     }
 }

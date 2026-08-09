@@ -68,6 +68,9 @@ pub fn open_or_create_index(config: &Config) -> Result<(tantivy::Index, LogField
     let schema = create_schema();
     let fields = LogFields::new(&schema)?;
     let index_dir = config.index_dir();
+    // Self-exclude the state directory from git before anything derived from
+    // log content lands inside it.
+    let _ = crate::config::ensure_base_dir();
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("Failed to create index directory: {:?}", index_dir))?;
     let directory = tantivy::directory::MmapDirectory::open(index_dir)
