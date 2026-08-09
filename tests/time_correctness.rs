@@ -44,10 +44,16 @@ fn append(path: &Path, body: &str) {
 }
 
 /// Run a read command and return its parsed envelope.
+/// Asserts on the envelope rather than the exit status: exit 2 means "zero
+/// results", which the contract defines as success, so a query that
+/// legitimately matches nothing must not read as a failure here.
 fn query(project: &Path, args: &[&str]) -> serde_json::Value {
-    let out = somethingsoff(project).args(args).assert().success();
+    let out = somethingsoff(project).args(args).assert();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"))
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"));
+    assert_eq!(value["ok"], true, "command failed: {stdout}");
+    value
 }
 
 fn segment_count(project: &Path) -> usize {
@@ -228,5 +234,107 @@ fn test_unnormalizable_timestamps_still_dedup_on_reingest() {
     assert_eq!(
         after["meta"]["total"], 1,
         "a rebuild must not duplicate an entry that borrowed ingest time"
+    );
+}
+
+/// A line carrying its own timestamp must be dated by that timestamp, even
+/// when no structured parser claims the line.
+///
+/// `<ISO-8601> <LEVEL> <message>` is what most hand-rolled and Node/Go
+/// loggers emit, and none of the eight format parsers matches it. Every such
+/// line was therefore stamped with *ingest* time, so `--last 1h` matched
+/// events years old and `errors` reported when the file was read rather than
+/// when the failure happened.
+#[test]
+fn test_leading_timestamp_on_unstructured_lines_is_the_event_time() {
+    let (temp, log_file) = setup_project();
+    append(
+        &log_file,
+        "2020-01-01T00:00:00Z ERROR ancient plaintext failure\n\
+         [2020-01-01 00:00:05] ERROR bracketed ancient failure\n\
+         2020-01-01T00:00:09+05:30 ERROR offset-aware ancient failure\n\
+         2020-01-01T00:00:11+0000 ERROR colonless-offset ancient failure\n",
+    );
+
+    let recent = query(
+        temp.path(),
+        &["--quiet", "search", "--level", "error", "--last", "1h"],
+    );
+    assert_eq!(
+        recent["meta"]["total"], 0,
+        "nothing here happened in the last hour; ingest time must not stand in \
+         for event time"
+    );
+
+    let all = query(
+        temp.path(),
+        &[
+            "--quiet",
+            "search",
+            "--level",
+            "error",
+            "--start",
+            "2019-01-01T00:00:00Z",
+            "-n",
+            "10",
+        ],
+    );
+    let mut stamps: Vec<&str> = all["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["timestamp"].as_str())
+        .collect();
+    stamps.sort_unstable();
+    assert_eq!(
+        stamps,
+        vec![
+            // 00:00:09 +05:30 is 18:30:09 UTC the previous day.
+            "2019-12-31T18:30:09.000Z",
+            "2020-01-01T00:00:00.000Z",
+            "2020-01-01T00:00:05.000Z",
+            "2020-01-01T00:00:11.000Z",
+        ],
+        "each line's own timestamp, normalized to UTC"
+    );
+}
+
+/// When a timestamp genuinely cannot be recovered, ingest time is a
+/// reasonable stand-in — but the entry has to admit it, or a caller reading
+/// `--last 1h` has no way to know the time was manufactured at read time.
+#[test]
+fn test_entries_dated_by_ingest_time_are_marked_as_such() {
+    let (temp, log_file) = setup_project();
+    append(&log_file, "widget factory failed, no timestamp anywhere\n");
+
+    let value = query(
+        temp.path(),
+        &["--quiet", "search", "--level", "error", "-n", "5"],
+    );
+    let entry = &value["data"]["results"][0];
+    assert_eq!(
+        entry["attributes"]["timestamp_source"], "ingest",
+        "a synthetic timestamp must be visible in the entry"
+    );
+}
+
+/// ...and an entry that carries a real timestamp must not be marked.
+#[test]
+fn test_parsed_timestamps_carry_no_ingest_marker() {
+    let (temp, log_file) = setup_project();
+    append(
+        &log_file,
+        "{\"time\":\"2026-08-10T09:00:00Z\",\"level\":\"error\",\"msg\":\"dated\"}\n",
+    );
+
+    let value = query(
+        temp.path(),
+        &["--quiet", "search", "--level", "error", "-n", "5"],
+    );
+    let entry = &value["data"]["results"][0];
+    assert!(
+        entry["attributes"]["timestamp_source"].is_null(),
+        "a parsed timestamp needs no marker, got {}",
+        entry["attributes"]
     );
 }

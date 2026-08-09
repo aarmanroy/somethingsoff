@@ -50,7 +50,9 @@ breaking changes and require a major version bump.
   applied filters as a snake_case object.
 - `notices` omitted when empty. Notable codes: `sync_deferred` (lock held,
   results possibly ~2s stale), `index_migrated`, `sampled` (schema profile
-  or patterns templates computed from a capped sample), `gitignore_updated`.
+  or patterns templates computed from a capped sample), `gitignore_updated`,
+  `no_sources` (discovery found no log files at all — an empty result means
+  nothing is indexed, not that nothing matched).
 
 ### `data` per command
 
@@ -83,6 +85,22 @@ line_number, attributes{…}, parse_format
 `attributes` holds every input field that didn't map to the core schema —
 nothing is silently dropped. Scalar attribute values are full-text
 searchable via `--query`.
+
+Two reserved attribute keys describe the entry's own timestamp rather than
+the input:
+
+- `original_timestamp` — the verbatim string when it could not be normalized.
+- `timestamp_source: "ingest"` (schema v8) — the entry carried no recoverable
+  time, so `timestamp` is *ingest* time, not event time. Absent means the
+  timestamp was parsed from the line. Anything reasoning about recency
+  (`--last`, `first_seen`/`last_seen`, "is this error new?") should treat
+  marked entries as undated.
+
+`log_id` identifies an entry by its content *and* its position within its
+logical source. Re-reading the same bytes — a replay, a rebuilt index, a
+rotated `app.log.1` — collapses to the same id; two separate occurrences of
+an identical line do not. Before schema v8 identity was content-only, which
+deleted all but one occurrence of any repeated line.
 
 `parse_format` (added in schema v5, always non-null) names the parser that
 understood the line at ingest: `json`, `logfmt`, `apache-combined`,

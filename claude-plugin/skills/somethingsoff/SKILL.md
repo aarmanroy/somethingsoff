@@ -102,3 +102,9 @@ time window or drop filters) · `3` usage/config · `4` index locked/corrupt ·
   Prefer `--dry-run` first.
 - A `notices[].code == "sync_deferred"` means another writer holds the lock
   (a `watch` or `tap` is running); results may lag by ~2s. That is normal.
+- A `notices[].code == "no_sources"` means nothing is indexed at all. Zero
+  results then says nothing about the app's health — do not report "no errors
+  in the logs". Say the logs aren't set up, and check the notice's hint.
+- An entry with `attributes.timestamp_source == "ingest"` carried no readable
+  timestamp, so its `timestamp` is when the line was *read*, not when the
+  event happened. Don't use those entries to argue something is recent or new.

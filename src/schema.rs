@@ -35,7 +35,16 @@ use tantivy::schema::*;
 /// `attributes.original_timestamp`. This changes both display and `log_id`
 /// for those docs, and the always-present `timestamp_ms` is what lets search
 /// order by the numeric fast field instead of the string one.
-pub const SCHEMA_VERSION: u32 = 7;
+///
+/// v8: `log_id` is salted with the ingest position for *every* entry, not
+/// just the unstamped ones, and the salt is keyed on the logical source
+/// rather than the file path. Content-keying treated identical text as the
+/// same event, so a burst of 200 identical Apache 500s collapsed to 4 docs
+/// (one per second) and two distinct requests that rendered alike deleted
+/// each other. Source-keying the salt keeps rotation dedup intact: a rotated
+/// `app.log.1` re-read from 0 reproduces the ids `app.log` already wrote.
+/// Every log_id changes, hence the rebuild.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Log entry as stored in the index and returned from searches.
 ///
@@ -570,6 +579,17 @@ impl LogEntry {
             None => None,
         };
         let has_own_timestamp = normalized.is_some();
+        if !has_own_timestamp {
+            // The timestamp below is *ingest* time, not event time. Mark it,
+            // or a caller has no way to tell: an entry backfilled from a
+            // month-old file answers `--last 1h` looking freshly minted, and
+            // `first_seen`/`last_seen` in `errors` report when we read the
+            // line rather than when the thing actually happened.
+            raw.extra.insert(
+                "timestamp_source".to_string(),
+                serde_json::Value::from("ingest"),
+            );
+        }
         let timestamp = normalized.unwrap_or_else(|| {
             chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -580,18 +600,28 @@ impl LogEntry {
         let message = raw.message.unwrap_or_default();
         let request_id = raw.request_id;
 
-        // Identity: entries with their own timestamp are content-keyed (same
-        // structured line always dedups). Entries without one get a synthetic
-        // ingest-time timestamp that varies per pass, so it must NOT enter
-        // the hash — their identity is position + content instead, which is
-        // stable across re-reads (replay dedup) yet distinct per occurrence
-        // (honest counts). With no position either (hand-built entries),
+        // Identity: content *plus* position within the logical source.
+        //
+        // Content alone is not an identity. An outage emits the same line
+        // hundreds of times, and every second-resolution format (Apache,
+        // nginx, syslog, Rails) renders those occurrences byte-identical —
+        // so content-keying silently deleted all but one of them, and two
+        // genuinely distinct requests that happened to render the same
+        // overwrote each other. Position separates real occurrences.
+        //
+        // The salt is keyed on the *source*, not the file path, so a rotated
+        // `app.log.1` re-read from offset 0 lands on the same ids the live
+        // `app.log` already contributed and still dedups.
+        //
+        // A synthetic ingest-time timestamp varies per pass, so it must not
+        // enter the hash. With no position either (hand-built entries),
         // identity degrades to content-only.
-        let (id_timestamp, position_salt) = if has_own_timestamp {
-            (timestamp.as_str(), None)
+        let id_timestamp = if has_own_timestamp {
+            timestamp.as_str()
         } else {
-            ("", raw.ingest_position.as_deref())
+            ""
         };
+        let position_salt = raw.ingest_position.as_deref();
         let log_id = generate_log_id(
             id_timestamp,
             &level,

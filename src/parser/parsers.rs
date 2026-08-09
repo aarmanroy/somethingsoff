@@ -118,12 +118,9 @@ pub fn parse_block(text: &str, source: &str) -> Option<RawLogEntry> {
             if !trimmed.chars().any(|c| c.is_alphanumeric()) {
                 return None;
             }
-            Some(RawLogEntry {
-                message: Some(trimmed.to_string()),
-                level: sniff_level(trimmed),
-                parse_format: Some("raw".to_string()),
-                ..Default::default()
-            })
+            let mut entry = raw_entry(trimmed);
+            entry.parse_format = Some("raw".to_string());
+            Some(entry)
         }
     }
 }
@@ -180,6 +177,69 @@ pub(crate) fn sniff_level(text: &str) -> Option<String> {
     }
 }
 
+/// A timestamp at the head of an otherwise unrecognized line, optionally
+/// bracketed. This is the shape most hand-rolled and framework loggers emit
+/// (`2026-08-10T09:00:00.123Z ERROR ...`), and no structured parser claims it.
+///
+/// Anchored and shape-specific on purpose: it runs only on lines nothing else
+/// matched, and a false match would mis-date a real event.
+static LEADING_TS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\]?[ \t]*",
+    )
+    .unwrap()
+});
+
+/// Split a leading timestamp off an unstructured line, returning it in
+/// canonical form alongside the remaining text.
+///
+/// Without this, a line carrying a perfectly good timestamp still fell through
+/// to ingest wall-clock time, so `--last 1h` matched events years old and
+/// "is this error new?" answered with *read* recency instead of event recency.
+///
+/// Returns `None` unless the captured text actually normalizes, so a timezone
+/// we cannot interpret leaves the line alone rather than silently re-dating it
+/// (reading `+0530` as UTC would shift the event by five and a half hours).
+pub(crate) fn split_leading_timestamp(text: &str) -> Option<(String, &str)> {
+    let caps = LEADING_TS_RE.captures(text)?;
+    let raw = caps.get(1)?.as_str();
+    let normalized = crate::schema::normalize_timestamp(raw).or_else(|| {
+        // `+0000` is a real-world spelling but not RFC3339; retry with the
+        // colon chrono requires.
+        let (head, offset) = raw.split_at(raw.len().checked_sub(4)?);
+        let plausible = head.ends_with(['+', '-']) && offset.chars().all(|c| c.is_ascii_digit());
+        plausible
+            .then(|| {
+                crate::schema::normalize_timestamp(&format!(
+                    "{}{}:{}",
+                    head,
+                    &offset[..2],
+                    &offset[2..]
+                ))
+            })
+            .flatten()
+    })?;
+    Some((normalized, text[caps.get(0)?.end()..].trim_start()))
+}
+
+/// Build a raw entry from already-cleaned text, lifting a leading timestamp
+/// when the line carries one so time filters see the event's real time.
+fn raw_entry(trimmed: &str) -> RawLogEntry {
+    match split_leading_timestamp(trimmed) {
+        Some((timestamp, rest)) if !rest.is_empty() => RawLogEntry {
+            timestamp: Some(timestamp),
+            message: Some(rest.to_string()),
+            level: sniff_level(rest),
+            ..Default::default()
+        },
+        _ => RawLogEntry {
+            message: Some(trimmed.to_string()),
+            level: sniff_level(trimmed),
+            ..Default::default()
+        },
+    }
+}
+
 /// Turn an unrecognized line into a raw text entry. Returns `None` for lines
 /// with no alphanumeric content (blank, ANSI-only, box-drawing decoration,
 /// non-UTF-8 replacement chars) — there is nothing worth indexing.
@@ -189,11 +249,7 @@ fn fallback_entry(line: &str, _source: &str) -> Option<RawLogEntry> {
     if !trimmed.chars().any(|c| c.is_alphanumeric()) {
         return None;
     }
-    Some(RawLogEntry {
-        message: Some(trimmed.to_string()),
-        level: sniff_level(trimmed),
-        ..Default::default()
-    })
+    Some(raw_entry(trimmed))
 }
 
 #[cfg(test)]

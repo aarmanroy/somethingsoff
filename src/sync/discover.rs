@@ -61,10 +61,12 @@ pub fn discover_sources(config: &Config, state: &SyncState) -> Vec<(String, Path
     }
 
     // 2. Zero-config scan of the conventional log directories, recursively.
+    // Resolved against the project root, not the CWD, so a query from a
+    // subdirectory still finds the project's logs instead of nothing.
     for dir in LOG_DIRS {
-        let root = Path::new(dir);
-        for path in scan_dir(root, &LOG_EXTENSIONS) {
-            if let Some(name) = source_name(root, &path) {
+        let root = crate::config::from_project_root(dir);
+        for path in scan_dir(&root, &LOG_EXTENSIONS) {
+            if let Some(name) = source_name(&root, &path) {
                 push(name, path.clone(), &mut seen_paths);
             }
         }
@@ -77,7 +79,7 @@ pub fn discover_sources(config: &Config, state: &SyncState) -> Vec<(String, Path
     // project root that same rule would index `package.json` and every README
     // adjacent text file. Here the `.log` extension carries the whole burden
     // of proof, and nothing else qualifies.
-    for path in scan_shallow(Path::new("."), &["log"]) {
+    for path in scan_shallow(&crate::config::from_project_root("."), &["log"]) {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             push(stem.to_string(), path.clone(), &mut seen_paths);
         }

@@ -207,13 +207,19 @@ fn test_deduplication_preserves_search_results() {
         .stdout(predicate::str::contains("\"total\":1"));
 }
 
+/// Two identical lines in one file are two events, not one.
+///
+/// This is the distinction the old content-only log_id could not make: it
+/// collapsed them, so a burst of repeated failures reported a count of 1.
+/// Repeated *bytes* must still dedup — that is what makes a replay safe — but
+/// repeated *occurrences* must not.
 #[test]
-fn test_deduplication_within_batch() {
+fn test_identical_lines_in_one_batch_are_distinct_occurrences() {
     let temp_dir = TempDir::new().unwrap();
     let base_dir = temp_dir.path();
     let log_file_path = base_dir.join("test.log");
 
-    // 2 identical lines + 1 unique = 3 indexed, 1 deduped
+    // 2 identical lines + 1 unique = 3 real events, nothing to deduplicate
     let mut f = File::create(&log_file_path).unwrap();
     writeln!(
         f,
@@ -242,9 +248,21 @@ fn test_deduplication_within_batch() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"entries_indexed\":3"))
-        .stdout(predicate::str::contains("\"entries_deduplicated\":1"));
+        .stdout(predicate::str::contains("\"entries_deduplicated\":0"));
 
-    // Search — exactly 2 unique
+    // Re-ingesting the same bytes is a replay: every line collapses.
+    let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
+    cmd.env("SOMETHINGSOFF_BASE_DIR", base_dir)
+        .arg("ingest")
+        .arg("--source")
+        .arg("test-batch-dedup")
+        .arg("--file")
+        .arg(&log_file_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"entries_deduplicated\":3"));
+
+    // Search — all 3 events survive, and the replay added nothing
     let mut cmd = Command::cargo_bin("somethingsoff").unwrap();
     let output = cmd
         .env("SOMETHINGSOFF_BASE_DIR", base_dir)
@@ -262,7 +280,8 @@ fn test_deduplication_within_batch() {
         .as_u64()
         .expect("meta.total should be a number");
     assert_eq!(
-        total_count, 2,
-        "Should have exactly 2 unique entries (one deduped), got {total_count}"
+        total_count, 3,
+        "Both identical lines are real occurrences and must survive; the \
+         re-ingest must not add a fourth. Got {total_count}"
     );
 }

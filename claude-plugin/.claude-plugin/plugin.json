@@ -1,7 +1,7 @@
 {
   "name": "somethingsoff",
   "displayName": "somethingsoff",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local-first log search for debugging: a skill that teaches Claude the CLI, plus hooks that answer from the index when a command fails or when Claude reaches for a raw log file",
   "author": {
     "name": "Aarman Roy",

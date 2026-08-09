@@ -153,6 +153,17 @@ pub fn ingest_new_lines(
     Ok((cursor, stats))
 }
 
+/// Identity-bearing position of one event: logical source + starting byte.
+///
+/// Keyed on the *source* rather than the file path on purpose. A rotated
+/// `app.log.1` is the same logical source as `app.log`, so re-reading it from
+/// offset 0 reproduces the ids the live file already contributed and dedups
+/// instead of duplicating. It is also what lets `tap`'s inline indexing and
+/// the later replay of its journal agree on ids.
+pub fn ingest_position(source: &str, first_byte: u64) -> String {
+    format!("{}:{}", source, first_byte)
+}
+
 /// Parse one coalesced event and upsert it. A `None` from `parse_block` is a
 /// decoration-only block (ANSI, box-drawing): nothing to index, not a failure.
 fn index_block(
@@ -164,9 +175,9 @@ fn index_block(
     stats: &mut TailStats,
 ) {
     if let Some(mut raw) = parse_block(&block.text, source) {
-        // Stable position: salts log_id for entries with no intrinsic
-        // timestamp (honest counts + replay-safe dedup, see schema v6).
-        raw.ingest_position = Some(format!("{}:{}", path.display(), block.first_byte));
+        // Stable position: salts every log_id so repeated occurrences of an
+        // identical line stay distinct, while re-reads still dedup (v8).
+        raw.ingest_position = Some(ingest_position(source, block.first_byte));
         let raw = crate::pii::redact_raw_entry(raw);
         let entry = LogEntry::from_raw(raw, source);
         if let Err(e) = upsert_entry(writer, fields, &entry, false) {

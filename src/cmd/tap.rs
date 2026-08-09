@@ -165,14 +165,7 @@ impl TapCommand {
             // which coalesces identically when replaying the journal)
             if let Some(ref mut idx) = indexer {
                 if let Some(block) = coalescer.push(&journal_line, line_start) {
-                    index_tap_block(
-                        &block,
-                        &journal_path,
-                        &source,
-                        idx,
-                        &mut indexed,
-                        &mut failed,
-                    );
+                    index_tap_block(&block, &source, idx, &mut indexed, &mut failed);
                 }
 
                 if idx.entries_since_commit >= COMMIT_EVERY_ENTRIES
@@ -195,14 +188,7 @@ impl TapCommand {
         journal.flush().ok();
         if let Some(ref mut idx) = indexer {
             if let Some(block) = coalescer.flush() {
-                index_tap_block(
-                    &block,
-                    &journal_path,
-                    &source,
-                    idx,
-                    &mut indexed,
-                    &mut failed,
-                );
+                index_tap_block(&block, &source, idx, &mut indexed, &mut failed);
             }
             if idx.entries_since_commit > 0 {
                 idx.writer.commit().context("Failed to commit index")?;
@@ -228,12 +214,12 @@ impl TapCommand {
     }
 }
 
-/// Parse one coalesced event and upsert it inline. Position = journal byte
-/// offset, identical to what sync computes replaying the journal — so inline
-/// and replay paths produce the same log_ids (no duplicates either way).
+/// Parse one coalesced event and upsert it inline. Position = source + journal
+/// byte offset, identical to what sync computes replaying the journal (whose
+/// discovered source name is the journal's file stem, i.e. this same source) —
+/// so inline and replay paths produce the same log_ids, no duplicates either way.
 fn index_tap_block(
     block: &Block,
-    journal_path: &std::path::Path,
     source: &str,
     idx: &mut InlineIndexer,
     indexed: &mut u64,
@@ -241,7 +227,7 @@ fn index_tap_block(
 ) {
     // A None from parse_block is a decoration-only event: not a failure.
     if let Some(mut raw) = parse_block(&block.text, source) {
-        raw.ingest_position = Some(format!("{}:{}", journal_path.display(), block.first_byte));
+        raw.ingest_position = Some(tail::ingest_position(source, block.first_byte));
         let raw = crate::pii::redact_raw_entry(raw);
         let entry = LogEntry::from_raw(raw, source);
         if crate::index::upsert::upsert_entry(&mut idx.writer, &idx.fields, &entry, false).is_ok() {

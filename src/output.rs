@@ -160,6 +160,21 @@ impl Envelope {
                 None,
             );
         }
+        // No sources at all is not the same answer as "no matching logs", and
+        // an empty result set cannot carry that difference on its own. Say it
+        // out loud, or a caller reads zero results as "the app is healthy".
+        // `disabled` skips discovery entirely, so a zero there is not evidence
+        // about sources.
+        if report.files_checked == 0 && report.reason.as_deref() != Some("disabled") {
+            self.notice(
+                "no_sources",
+                &format!(
+                    "No log sources found under {} — results are empty because nothing is indexed, not because nothing matched",
+                    crate::config::project_root().display()
+                ),
+                Some("Create ./logs/ (or ./log/), point `log_sources` in .somethingsoff/config.toml at your files, or pipe output through `somethingsoff tap`."),
+            );
+        }
         self.sync = Some(report);
     }
 

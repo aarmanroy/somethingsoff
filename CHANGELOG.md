@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-08-10
+
+Three silent-wrong-answer bugs, found by asking the tool questions with
+known answers and checking the arithmetic. The first destroyed most of the
+index on exactly the logs people reach for during an outage.
+
+The index rebuilds itself transparently on first query (schema v8).
+
+### Fixed
+
+- **An outage's logs were 98% deleted at ingest.** `log_id` was derived from
+  content alone (`timestamp + level + source + message + request_id`), and
+  `upsert` *deletes* the prior document on an id collision. Every
+  second-resolution format — Apache, nginx, syslog, Rails — renders repeated
+  events byte-identically, so a burst of 200 HTTP 500s over four seconds
+  indexed as **4 documents**, and `errors` reported `4 x GET /checkout`
+  where the README promises `438x`. Worse, it was not limited to duplicates:
+  three distinct requests in the same second returning 200, 500 and 503 left
+  **two** entries — the 500 was overwritten by the 503. `log_id` is now
+  salted with the ingest position for every entry, keyed on the logical
+  source, so repeated occurrences stay distinct while re-reads still dedup.
+  Reported `ingested` counts were honest all along; the documents were being
+  deleted behind them.
+
+- **Rotation duplicated raw entries.** The position salt already applied to
+  unstamped entries used the *file path*, so `app.log.1` re-read after
+  rotation produced fresh ids for content already indexed under `app.log`
+  (3 entries became 6). Keying the salt on the source rather than the path
+  fixes this too — a rotated file reproduces the ids the live file wrote.
+
+- **Any query from a subdirectory silently answered "no logs".** State and
+  the `logs/` scan resolved against the process working directory, so
+  `somethingsoff errors --last 24h` run from `src/` returned
+  `{"ok": true, "total_errors": 0}` — indistinguishable, to anything reading
+  the JSON contract, from a healthy app — and stranded a second empty index
+  in that subdirectory. Normal in a monorepo, where logs sit at the repo root
+  and work happens in `packages/*`. Both now resolve against the project root
+  (nearest `.somethingsoff`, else `.git`, else CWD).
+
+- **Timestamps silently fell back to ingest time.** `<ISO-8601> <LEVEL>
+  <message>` — what most hand-rolled, Node and Go loggers emit — matched none
+  of the eight parsers, so every such line was stamped with the moment it was
+  read. A file of lines dated 2020, queried with `--last 1h`, returned them.
+  Every downstream claim inherited it: `first_seen`/`last_seen`, "is this
+  error new?", "did my fix work?". A leading timestamp (bare, bracketed, or
+  with a `+05:30`/`+0000` offset) is now lifted off unstructured lines, and
+  only forms that actually normalize are consumed, so an uninterpretable
+  offset leaves the line alone rather than shifting the event.
+
+### Added
+
+- `attributes.timestamp_source: "ingest"` marks entries whose timestamp was
+  manufactured at read time, so a synthetic date is visible rather than
+  assumed. Entries with a real parsed timestamp carry no marker.
+- A `no_sources` notice on read commands when discovery finds nothing, so an
+  empty result set distinguishes "nothing matched" from "nothing is indexed".
+
 ## [0.4.0] - 2026-08-09
 
 Three of these were confident wrong answers rather than visible failures,
