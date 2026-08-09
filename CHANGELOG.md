@@ -4,6 +4,90 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-08-09
+
+Three of these were confident wrong answers rather than visible failures,
+which for a tool whose index an LLM reads is the worst failure mode there
+is. All were found by auditing against real logs, and each now has a
+regression test that the previous suite was structurally unable to write.
+
+### Fixed
+
+- **`search` returned the wrong documents on any real index.** Ordering
+  used `order_by_u64_field` against the `timestamp` *string* field, which
+  sorts by segment-local term ordinal. On a single-segment index — which
+  is what every test built — that looks correct. On a 3-segment index, a
+  newest-first query returned the *oldest* batch. Ordering now uses the
+  `timestamp_ms` u64 fast field that already existed in the schema.
+
+- **Every Java/log4j line was invisible to every time filter.** The parser
+  appended `.000` to a time that already carried millis, producing
+  `10:00:01.500.000Z`; normalization rejected it, so the entry got no
+  `timestamp_ms`. `search --level error` found 2 entries and
+  `search --level error --last 24h` found 0. The parser and detector also
+  required exactly three fractional digits, so `%d{yyyy-MM-dd HH:mm:ss}`
+  and micro/nanosecond precision fell through to the raw fallback and lost
+  their timestamps entirely.
+
+- **An unnormalizable timestamp was stored verbatim**, leaving the entry
+  with no `timestamp_ms` — present in totals, unreachable by every time
+  query. A time-only `01:57:10.385` (Next.js writes these) was indexed,
+  reported as valid JSON by `stats --by-format`, and could not be found by
+  `--last 100000h`. Such entries now fall back to ingest time with the
+  original preserved in `attributes.original_timestamp`.
+
+- **PII redaction failed open on essentially every credential minted after
+  ~2015.** Every pattern was keyword-anchored, firing only next to
+  `token=` or `password:`, so bare credentials passed through verbatim:
+  `ghp_`, `github_pat_`, `glpat-`, `sk-ant-`, `sk-proj-`,
+  `sk_live_`/`rk_test_`, `xoxb-`, `AIza`, `npm_`, `hf_`, raw JWTs and PEM
+  private key blocks. These are now matched on shape alone. URL
+  credentials are redacted while keeping the scheme and host legible.
+
+- **`tap` wrote the unredacted line to disk.** The journal at
+  `.somethingsoff/streams/*.jsonl` was written before anything parsed it,
+  making it the one place a secret outlived redaction. It is now redacted
+  and created `0600`. Stdout passthrough stays verbatim.
+
+- **Redaction destroyed real content.** A missing word boundary meant
+  `pass` matched inside ordinary words, indexing `compass=north` as
+  `compass [REDACTED]`.
+
+### Added
+
+- **Discovery finds the logs projects actually write.** The scan was
+  exactly `./logs/*.{log,json,jsonl}`, one level deep — three of eleven
+  real-world path shapes. Now also: `log/` (Rails, Django, Java), nested
+  files recursively, `.ndjson`/`.txt`/`.out`/`.err`, rotated files
+  (`app.log.1`, sharing the live file's source name), and root-level
+  `*.log`. Compressed rotations are skipped; recursion is bounded (depth
+  4, 512 files) so a symlink cycle stops rather than spins. The root scan
+  takes `.log` only, so `package.json` is never mistaken for a log.
+
+- **A Rails parser.** A 285k-line `log/development.log` indexed as 100%
+  `raw`, so `--request-id`, `--status` and `--slow-above` returned
+  nothing and the request UUID polluted every mined error template.
+  Extracts the tagged request id, method and route, status and duration.
+
+- **`SOMETHINGSOFF_HOOK_DEBUG=1`** traces each hook decision to stderr,
+  which Claude Code surfaces under `claude --debug`. The hook exits 0 in
+  silence on every path with nothing to say, which made "no errors in the
+  window", "rate-limited" and "broken" indistinguishable.
+
+- **`.somethingsoff/` now creates a `.gitignore` excluding itself**, so a
+  directory of indexed log content cannot be committed by accident.
+
+### Changed
+
+- `SCHEMA_VERSION` 6 → 7. Existing indexes rebuild transparently on the
+  next read; sources are on disk, so this costs one slower query.
+
+- The hook payload is parsed field by field rather than through a derived
+  `Deserialize`. One field arriving with an unexpected type used to
+  discard the whole event and disable the hook permanently and silently.
+  The failure text is accepted under `error`, `error_message` or
+  `failure_reason`.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

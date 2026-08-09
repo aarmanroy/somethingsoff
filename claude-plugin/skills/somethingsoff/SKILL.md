@@ -8,7 +8,7 @@ metadata:
 # Searching application logs with somethingsoff
 
 `somethingsoff` is a local-first log index. **Zero setup**: read commands
-auto-discover log files in `./logs/`, create the index, and ingest new data
+auto-discover log files in `./logs/` and `./log/` (recursively), create the index, and ingest new data
 before answering — never run an ingest or rebuild step first. Results are
 always fresh. Nothing leaves the machine.
 

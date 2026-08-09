@@ -44,14 +44,19 @@ src/
                      from_value() alias mapping (camelCase/epoch/msg→message),
                      normalize_timestamp(), log_id content hash, SCHEMA_VERSION,
                      Tantivy schema (create_schema)
-  pii.rs             regex redaction (emails/tokens/cards/secrets), applied
-                     at ingest incl. recursive attribute values
+  pii.rs             regex redaction, applied at ingest incl. recursive
+                     attribute values. Two families: keyword-anchored
+                     (password=, token:) and self-identifying (ghp_, sk-ant-,
+                     JWT, PEM, url creds) which need no keyword. Order
+                     matters — keyword patterns run first, see redact_string.
   sync/              THE ENGINE (heart of "just works")
     mod.rs           sync_before_read(): fast path (stat vs state) → lock →
                      run_sync(); needs_migration()/migrate_index() for
                      SCHEMA_VERSION bumps (transparent rebuild)
-    discover.rs      source union: config [log_sources] + ./logs/*.{log,json,
-                     jsonl} + tap journals (streams/*.jsonl) + state entries
+    discover.rs      source union: config [log_sources] + recursive scan of
+                     ./logs/ and ./log/ ({log,json,jsonl,ndjson,txt,out,err},
+                     plus rotated app.log.N; compressed skipped) + root *.log
+                     + tap journals (streams/*.jsonl) + state entries
     tail.rs          FileCursor, rotation detection (shrink or head-
                      fingerprint change), ingest_new_lines() — the ONE
                      read→parse→redact→upsert loop
@@ -61,7 +66,7 @@ src/
                      and degrade to stale read, writers retry ≤5s
   parser/
     detector.rs      per-line format detection, priority: JSON → logfmt →
-                     apache → python → go-logrus → log4j → syslog
+                     apache → python → go-logrus → log4j → rails → syslog
     parsers/         one parser per format; logfmt/JSON route through
                      RawLogEntry::from_value so aliases + attributes apply
     learn.rs         regex suggestions for unknown formats (advisory)
@@ -92,7 +97,9 @@ claude-plugin/       the Claude Code plugin: .claude-plugin/plugin.json,
                      marketplace.json makes the repo itself a marketplace.
 docs/CONTRACT.md     frozen v1 output contract (envelope/exit codes/behavior)
 tests/               integration suites: contract, autosync, attributes, tap,
-                     claude_install, claude_hook, + legacy (ingest_search, …)
+                     claude_install, claude_hook, discovery (which files get
+                     found), time_correctness (multi-segment ordering, log4j
+                     and unnormalizable timestamps), + legacy (ingest_search, …)
 ```
 
 ## Data flow
@@ -129,12 +136,17 @@ registers cursor so auto-sync takes over).
 ## Developing
 
 ```bash
-cargo test                                   # 14 suites, all must pass
+cargo test                                   # 18 suites, all must pass
 cargo clippy --all-targets -- -D warnings    # CI-enforced
 cargo fmt --all                              # CI-enforced
 ```
 
 Manual smoke: `mkdir -p /tmp/d/logs && cd /tmp/d && echo '{"level":"error","message":"x"}' > logs/a.log && somethingsoff search --level error`.
+
+Debugging the Claude Code hook: `SOMETHINGSOFF_HOOK_DEBUG=1` traces every
+decision to stderr (Claude Code shows it under `claude --debug`). The hook is
+silent by design on every path with nothing to say, so this is the only way to
+tell "no errors in the window" apart from "broken".
 
 Known gotchas:
 - Tests set `SOMETHINGSOFF_BASE_DIR` to temp dirs; never rely on cwd state.

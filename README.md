@@ -48,7 +48,7 @@ No plugin? `somethingsoff claude install` writes the same skill to `.claude/skil
 
 ## Quickstart
 
-**Option 1 — log files.** Drop (or point your app's file logger at) `./logs/*.log|json|jsonl`, then just query:
+**Option 1 — log files.** Drop (or point your app's file logger at) `./logs/` or `./log/` — scanned recursively for `.log`, `.json`, `.jsonl`, `.ndjson`, `.txt`, `.out`, `.err` and rotated `app.log.N`; a root-level `*.log` is picked up too. Then just query:
 
 ```bash
 somethingsoff search --level error --last 24h
@@ -68,7 +68,7 @@ python app.py 2>&1 | somethingsoff tap
 ## How it works
 
 - **Auto-ingest-on-query**: every read command checks your sources first (a stat per file — ~10ms when nothing changed), tails only new bytes into a [Tantivy](https://github.com/quickwit-oss/tantivy) full-text index, then answers. No `ingest`/`rebuild` step, no watcher required.
-- **Formats auto-detected per line**: JSON, logfmt, Python logging, syslog (RFC3164/5424), Apache/Nginx, Go logrus, Log4j. Mixed formats in one file are fine.
+- **Formats auto-detected per line**: JSON, logfmt, Python logging, syslog (RFC3164/5424), Apache/Nginx, Go logrus, Log4j, Rails. Mixed formats in one file are fine.
 - **Lossless — nothing is dropped**: unknown JSON fields (and camelCase aliases like `requestId`, `msg`, `durationMs`) map into the schema or land in a searchable `attributes` object. Any line that matches *no* structured format — plain dev-server, build, or test output — is still captured as a raw text entry (ANSI stripped, level sniffed), and multiline stack traces / compiler diagnostics coalesce into single events.
 - **Error intelligence**: `errors` groups near-duplicate failures by masked template — `Connection timeout to db-<num> after <num>ms: 438×` instead of 438 lines.
 - **State is disposable**: entries are deduplicated by content hash, so a lost cursor file or a re-ingested file can never produce duplicates or wrong results.
